@@ -1,3 +1,4 @@
+#include "PartitionAttrs.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -105,12 +106,10 @@ std::unique_ptr<Graph> buildGraph(Operation *region) {
 
           // init iter args
           {
-            size_t idx = 0;
-            for (auto operand : forOp.getInitArgs()) {
+            for (size_t idx = 0; idx < forOp.getInitArgs().size(); ++idx) {
               auto iter_arg_node = node->getDefines()[idx + 1];
               operands[std::make_pair(op, idx + 3)] =
                   InputPort(iter_arg_node, 0);
-              idx++;
             }
           }
 
@@ -218,7 +217,7 @@ SmallVector<OutputPort> initialDataValues(Graph *graph) {
   graph->walk([&](Node *node) {
     if (node->isOp()) {
       auto op = node->getOp();
-      if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op)) {
+      if (isa<tt::DescriptorLoadLikeOpInterface>(op)) {
         node->setDataValue(0);
         values.push_back({node, 0});
       }
@@ -228,8 +227,7 @@ SmallVector<OutputPort> initialDataValues(Graph *graph) {
         node->setDataValue(1);
         values.push_back({node, 1});
       }
-      // TODO: Support TCGen5MMAScaledOp
-      if (isa<nvidia_gpu::TCGen5MMAOp>(op)) {
+      if (isa<nvidia_gpu::TCGen5MMAOp, nvidia_gpu::TCGen5MMAScaledOp>(op)) {
         node->setDataValue(0);
         values.push_back({node, 0});
       }
@@ -429,12 +427,18 @@ SmallVector<std::pair<std::string, std::function<bool(Edge)>>> heuristics = {
          return false;
        }
 
-       if (node_isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(
-               edge.getFromNode())) {
-         // require layouts to match for TMA load + alloc
+       if (node_isa<tt::DescriptorLoadLikeOpInterface>(edge.getFromNode())) {
          auto load = edge.getFromNode()->getOp();
          auto alloc = cast<ttg::LocalAllocOp>(edge.getToNode()->getOp());
-         return getSharedEncoding(load) == alloc.getType().getEncoding();
+         auto loadEnc = getSharedEncoding(load);
+         auto allocEnc = alloc.getType().getEncoding();
+         if (loadEnc == allocEnc)
+           return true;
+
+         auto loadLayoutEnc = cast<ttg::LayoutEncodingTrait>(loadEnc);
+         auto allocLayoutEnc = cast<ttg::LayoutEncodingTrait>(allocEnc);
+         return ttg::areLayoutsEquivalent(alloc.getType().getShape(),
+                                          loadLayoutEnc, allocLayoutEnc);
        }
 
        if (node_isa<tt::LoadOp>(edge.getFromNode())) {
@@ -1454,6 +1458,12 @@ struct PartitionScheduling
       analyze(idx, op);
       if (hasPartition(op))
         cloneMultiPartitionDataOps(op);
+      if (auto loop = dyn_cast<scf::ForOp>(op);
+          loop && loop->hasAttr(kPartitionStagesAttrName) &&
+          failed(verifyPartitionedLoop(loop))) {
+        signalPassFailure();
+        return;
+      }
       idx++;
     }
   }

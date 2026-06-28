@@ -6,17 +6,18 @@ if(POLICY CMP0116)
   cmake_policy(SET CMP0116 OLD)
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
-
-set(CMAKE_INCLUDE_CURRENT_DIR ON)
-
 project(triton CXX C)
 include(CTest)
 include(GNUInstallDirs)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_INCLUDE_CURRENT_DIR ON)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-# Options
+################################################################################
+# Triton configuration
+################################################################################
+
 option(TRITON_BUILD_PYTHON_MODULE "Build Python Triton bindings" OFF)
 option(TRITON_BUILD_PROTON "Build the Triton Proton profiler" ON)
 option(TRITON_BUILD_UT "Build C++ Triton Unit Tests" ON)
@@ -38,6 +39,7 @@ set(TRITON_CUDACRT_PATH "" CACHE PATH "Path to CUDA CRT headers.")
 set(TRITON_CUDART_PATH "" CACHE PATH "Path to CUDA Runtime headers")
 set(TRITON_CUPTI_INCLUDE_PATH "" CACHE PATH "Path to CUPTI headers")
 set(TRITON_CUPTI_LIB_PATH "" CACHE PATH "Path to CUPTI libraries")
+set(TRITON_CUPTI_LIB_BLACKWELL_PATH "" CACHE PATH "Path to Blackwell CUPTI libraries")
 
 if(NOT TRITON_CACHE_PATH)
   message(FATAL_ERROR "TRITON_CACHE_PATH must be set or derivable from TRITON_HOME/HOME/USERPROFILE/HOMEPATH.")
@@ -80,6 +82,9 @@ endif()
 if(NOT "${TRITON_CUPTI_LIB_PATH}" STREQUAL "")
   list(APPEND TRITON_BUILD_HELPER_COMMON_ARGS --triton-cupti-lib-path "${TRITON_CUPTI_LIB_PATH}")
 endif()
+if(NOT "${TRITON_CUPTI_LIB_BLACKWELL_PATH}" STREQUAL "")
+  list(APPEND TRITON_BUILD_HELPER_COMMON_ARGS --triton-cupti-lib-blackwell-path "${TRITON_CUPTI_LIB_BLACKWELL_PATH}")
+endif()
 
 # Resolve third-party package paths in CMake so direct CMake builds don't rely on setup.py.
 set(TRITON_HAS_LLVM_SYSPATH OFF)
@@ -110,7 +115,7 @@ set_property(
   APPEND
   PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/python/build_helpers.py"
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/llvm-hash.txt"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/llvm-info.json"
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/json-version.txt"
 )
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -170,7 +175,6 @@ if (TRITON_PARALLEL_LINK_JOBS)
     set(CMAKE_JOB_POOL_LINK link_job_pool)
 endif()
 
-
 # Ensure Python3 vars are set correctly
 # used conditionally in this file and by lit tests
 
@@ -209,10 +213,10 @@ else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__STDC_FORMAT_MACROS")
 endif()
 
-
-# #########
+################################################################################
 # LLVM
-# #########
+################################################################################
+
 if(NOT MLIR_DIR)
   set(MLIR_DIR ${LLVM_LIBRARY_DIR}/cmake/mlir)
 endif()
@@ -231,7 +235,10 @@ include(TableGen) # required by AddMLIR
 include(AddLLVM)
 include(AddMLIR)
 
+################################################################################
 # Utilities
+################################################################################
+
 function(add_triton_object name)
   cmake_parse_arguments(ARG "" "" "DEPENDS;LINK_LIBS" ${ARGN})
   add_library(${name} OBJECT)
@@ -239,9 +246,6 @@ function(add_triton_object name)
     PRIVATE ${ARG_UNPARSED_ARGUMENTS}
     INTERFACE $<TARGET_OBJECTS:${name}>
   )
-
-
-  # add_library(${name} OBJECT ${ARG_UNPARSED_ARGUMENTS})
   if(ARG_DEPENDS)
     add_dependencies(${name} ${ARG_DEPENDS})
   endif()
@@ -263,10 +267,13 @@ function(add_triton_plugin name)
   add_triton_object(${name} ${ARGN})
 endfunction()
 
-# Disable warnings that show up in external code (gtest;pybind11)
+################################################################################
+# Compiler flags
+################################################################################
+
+# Disable warnings that show up in external code (gtest;nanobind)
 if(NOT MSVC)
   set(TRITON_DISABLE_EH_RTTI_FLAGS "$<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions;-fno-rtti>")
-
   if(NOT TRITON_EXT_ENABLED)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=hidden")
   else()
@@ -276,7 +283,6 @@ if(NOT MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DTRITON_EXT_ENABLED=1")
   endif()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wno-covered-switch-default ")
-
 else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4244 /wd4624 /wd4715 /wd4530")
 endif()
@@ -289,7 +295,6 @@ include_directories(${PROJECT_BINARY_DIR}/include) # Tablegen'd files
 include_directories(${PROJECT_SOURCE_DIR}/third_party)
 include_directories(${PROJECT_BINARY_DIR}/third_party) # Tablegen'd files
 
-# link_directories(${LLVM_LIBRARY_DIR})
 add_subdirectory(include)
 add_subdirectory(lib)
 
@@ -300,9 +305,10 @@ if (NOT WIN32 AND NOT APPLE AND NOT BSD)
   link_libraries(stdc++fs)
 endif()
 
-# -----
+################################################################################
+# Python module
+################################################################################
 
-# ------
 if(TRITON_BUILD_PYTHON_MODULE)
   message(STATUS "Adding Python module")
   set(PYTHON_SRC_PATH ${CMAKE_CURRENT_SOURCE_DIR}/python/src)
@@ -310,7 +316,21 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
   # Python Interpreter is used to run lit tests
   find_package(Python3 REQUIRED COMPONENTS Development.Module Interpreter)
-  find_package(pybind11 CONFIG REQUIRED HINTS "${Python3_SITELIB}")
+  # nanobind expects find_package(Python) which sets Python::Module target
+  # and Python_* variables. Triton uses find_package(Python3) instead.
+  # Bridge the two by aliasing the target and forwarding variables.
+  if(NOT TARGET Python::Module)
+    add_library(Python::Module ALIAS Python3::Module)
+    set(Python_EXECUTABLE "${Python3_EXECUTABLE}")
+    set(Python_INCLUDE_DIRS "${Python3_INCLUDE_DIRS}")
+    set(Python_SOABI "${Python3_SOABI}")
+    set(Python_VERSION "${Python3_VERSION}")
+    set(Python_INTERPRETER_ID "${Python3_INTERPRETER_ID}")
+  endif()
+
+  find_package(nanobind CONFIG REQUIRED HINTS "${Python3_SITELIB}")
+  nanobind_build_library(nanobind-static)
+  target_link_libraries(nanobind-static PRIVATE Python3::Module)
 
   foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
     add_subdirectory(third_party/${CODEGEN_BACKEND})
@@ -368,34 +388,12 @@ if(TRITON_BUILD_PYTHON_MODULE)
     # LLVM
     LLVMPasses
     LLVMNVPTXCodeGen
-    # LLVMNVPTXAsmPrinter
     LLVMAMDGPUCodeGen
     LLVMAMDGPUAsmParser
 
     Python3::Module
-    pybind11::headers
-
+    nanobind-static
   )
-  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR # Linux arm64
-     CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" OR # macOS arm64
-     CMAKE_OSX_ARCHITECTURES MATCHES "arm64")  # also macOS arm64
-      list(APPEND TRITON_LIBRARIES
-          LLVMAArch64CodeGen
-          LLVMAArch64AsmParser
-      )
-  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64")
-      list(APPEND TRITON_LIBRARIES
-          LLVMX86CodeGen
-          LLVMX86AsmParser
-      )
-  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le")
-      list(APPEND TRITON_LIBRARIES
-        LLVMPowerPCAsmParser
-        LLVMPowerPCCodeGen
-      )
-  else()
-    message(FATAL_ERROR "LLVM codegen/ASM parser libs: This HW architecture (${CMAKE_SYSTEM_PROCESSOR}) is not configured in cmake lib dependencies.")
-  endif()
 
   # Define triton library
   string(JOIN "," TRITON_BACKENDS_TUPLE ${TRITON_CODEGEN_BACKENDS})
@@ -421,7 +419,6 @@ if(TRITON_BUILD_PYTHON_MODULE)
   # Link triton with its dependencies
   target_link_libraries(triton PRIVATE ${TRITON_LIBRARIES})
 
-
   # Do not propagate libraries that libtriton depends on. This ensures that
   # targets that link against libtriton do not accidentally link in their own
   # copies of core Triton code and LLVM.
@@ -435,6 +432,23 @@ if(TRITON_BUILD_PYTHON_MODULE)
     target_link_libraries(triton PRIVATE z)
   endif()
   target_link_options(triton PRIVATE ${LLVM_LDFLAGS})
+
+  if(NOT TRITON_EXT_ENABLED)
+    # When extensions are disabled, only export the Python entrypoint.
+    set(TRITON_EXPORT_SYMBOLS_FILE "${CMAKE_CURRENT_BINARY_DIR}/triton.exports")
+    if(APPLE)
+      set(TRITON_EXPORT_SYMBOLS_FILE_CONTENT "_PyInit_libtriton\n")
+      target_link_options(triton PRIVATE
+        "LINKER:-exported_symbols_list,${TRITON_EXPORT_SYMBOLS_FILE}")
+    elseif(UNIX)
+      set(TRITON_EXPORT_SYMBOLS_FILE_CONTENT
+        "{\n  global:\n    PyInit_libtriton;\n  local:\n    *;\n};\n")
+      target_link_options(triton PRIVATE
+        "LINKER:--version-script,${TRITON_EXPORT_SYMBOLS_FILE}")
+    endif()
+    file(GENERATE OUTPUT "${TRITON_EXPORT_SYMBOLS_FILE}"
+      CONTENT "${TRITON_EXPORT_SYMBOLS_FILE_CONTENT}")
+  endif()
 
   install(TARGETS triton
     COMPONENT libraries
@@ -456,11 +470,9 @@ if(TRITON_BUILD_PYTHON_MODULE)
     COPYONLY)
 
   # Build plugins when building libtriton since they depend on libtriton.
-  add_subdirectory(examples/plugins)
-endif()
-
-if (UNIX AND NOT APPLE AND NOT TRITON_EXT_ENABLED)
-  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--exclude-libs,ALL")
+  if(TRITON_EXT_ENABLED)
+    add_subdirectory(examples/plugins)
+  endif()
 endif()
 
 if(TRITON_BUILD_PYTHON_MODULE AND NOT WIN32)
@@ -497,7 +509,9 @@ if(TRITON_BUILD_UT)
   )
 endif()
 
+################################################################################
 # Header installation
+################################################################################
 
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/
   COMPONENT headers
@@ -506,8 +520,12 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/
 install(DIRECTORY ${PROJECT_BINARY_DIR}/include/
   COMPONENT headers
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-  FILES_MATCHING PATTERN "*.h.inc")
+  FILES_MATCHING PATTERN "*.h" PATTERN "*.h.inc")
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/
   COMPONENT headers
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
   FILES_MATCHING PATTERN "*.td")
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/python/
+  COMPONENT headers
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/python
+  FILES_MATCHING PATTERN "*.h")

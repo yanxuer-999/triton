@@ -19,6 +19,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
 
@@ -161,13 +162,14 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
                        << "\n";
     }
     // Get the LLVM values for pointers
-    auto ptrElems = unpackLLElements(loc, llPtr, rewriter);
+    auto ptrElems = unpackTensorElements(loc, llPtr, rewriter, ptr.getType());
     assert(ptrElems.size() == numElems);
 
     // Get the LLVM values for mask
     SmallVector<Value> maskElems;
     if (llMask) {
-      maskElems = unpackLLElements(loc, llMask, rewriter);
+      maskElems =
+          unpackTensorElements(loc, llMask, rewriter, op.getMask().getType());
       assert(maskElems.size() == numElems);
     }
 
@@ -185,7 +187,8 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
     }
     SmallVector<Value> otherElems;
     if (other) {
-      otherElems = unpackLLElements(loc, llOther, rewriter);
+      otherElems =
+          unpackTensorElements(loc, llOther, rewriter, other.getType());
     }
 
     // vectorized iteration through all the pointer/mask/other elements
@@ -287,6 +290,8 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
                      .global()
                      .o("ca", op.getCache() == triton::CacheModifier::CA)
                      .o("cg", op.getCache() == triton::CacheModifier::CG)
+                     .o("cs", op.getCache() == triton::CacheModifier::CS)
+                     .o("cv", op.getCache() == triton::CacheModifier::CV)
                      .o("L1::evict_first",
                         op.getEvict() == triton::EvictionPolicy::EVICT_FIRST)
                      .o("L1::evict_last",
@@ -334,9 +339,8 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
       }
     } // end vec
 
-    Type llvmResultStructTy = typeConverter->convertType(op.getType());
-    Value resultStruct = packLLElements(loc, typeConverter, loadedVals,
-                                        rewriter, llvmResultStructTy);
+    Value resultStruct = packTensorElements(loc, typeConverter, loadedVals,
+                                            rewriter, op.getType());
     rewriter.replaceOp(op, {resultStruct});
     return success();
   }
@@ -375,8 +379,9 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     unsigned vec = getVectorSize(ptr);
     unsigned elemsPerThread = getTotalElemsPerThread(ptr.getType());
 
-    auto ptrElems = unpackLLElements(loc, llPtr, rewriter);
-    auto valueElems = unpackLLElements(loc, llValue, rewriter);
+    auto ptrElems = unpackTensorElements(loc, llPtr, rewriter, ptr.getType());
+    auto valueElems =
+        unpackTensorElements(loc, llValue, rewriter, op.getValue().getType());
     assert(ptrElems.size() == valueElems.size());
 
     // Determine the vectorization size
@@ -384,7 +389,8 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     SmallVector<Value> maskElems;
     if (llMask) {
       Value mask = op.getMask();
-      maskElems = unpackLLElements(loc, llMask, rewriter);
+      maskElems =
+          unpackTensorElements(loc, llMask, rewriter, op.getMask().getType());
       assert(valueElems.size() == maskElems.size());
 
       unsigned maskAlign = getMaskAlignment(mask);
@@ -505,13 +511,29 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
 };
 
 void createBarrier(ConversionPatternRewriter &rewriter, Location loc,
-                   int numCTAs) {
+                   int numCTAs, Operation *sourceOp) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   if (numCTAs == 1) {
     b.barrier(ttg::AddrSpace::Local);
   } else {
-    triton::nvidia_gpu::ClusterBarrierOp::create(rewriter, loc);
+    auto barrier = triton::nvidia_gpu::ClusterBarrierOp::create(rewriter, loc);
+    triton::nvidia_gpu::copyClusterBarrierMbarOffset(sourceOp, barrier);
   }
+}
+
+Value loadScalarAtomicResult(ConversionPatternRewriter &rewriter, Location loc,
+                             const NVIDIA::TargetInfo &targetInfo,
+                             Value atomPtr, Type valueTy, int numCTAs);
+
+Value loadScalarAtomicResult(ConversionPatternRewriter &rewriter, Location loc,
+                             const NVIDIA::TargetInfo &targetInfo,
+                             Value atomPtr, Type valueTy, int numCTAs) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  if (numCTAs == 1)
+    return b.load(valueTy, atomPtr);
+  // Scalar atomics are issued by CTA 0, so read CTA 0's scratch allocation.
+  return targetInfo.loadDShared(rewriter, loc, atomPtr, b.i32_val(0), valueTy,
+                                b.true_val());
 }
 
 struct AtomicCASOpConversion
@@ -539,9 +561,12 @@ struct AtomicCASOpConversion
     Value llCmp = adaptor.getCmp();
     Value llVal = adaptor.getVal();
 
-    auto ptrElements = unpackLLElements(loc, llPtr, rewriter);
-    auto cmpElements = unpackLLElements(loc, llCmp, rewriter);
-    auto valElements = unpackLLElements(loc, llVal, rewriter);
+    auto ptrElements =
+        unpackTensorElements(loc, llPtr, rewriter, op.getPtr().getType());
+    auto cmpElements =
+        unpackTensorElements(loc, llCmp, rewriter, op.getCmp().getType());
+    auto valElements =
+        unpackTensorElements(loc, llVal, rewriter, op.getVal().getType());
 
     auto valueTy = op.getType();
     auto tensorTy = dyn_cast<RankedTensorType>(valueTy);
@@ -594,8 +619,9 @@ struct AtomicCASOpConversion
         st(dstOprStore, valOprStore).maybePredicate(threadPred);
         auto ASMReturnTy = void_ty(ctx);
         ptxBuilderStore.launch(rewriter, loc, ASMReturnTy);
-        createBarrier(rewriter, loc, numCTAs);
-        Value ret = b.load(valueElemTy, atomPtr);
+        createBarrier(rewriter, loc, numCTAs, op);
+        Value ret = loadScalarAtomicResult(rewriter, loc, targetInfo, atomPtr,
+                                           valueElemTy, numCTAs);
         rewriter.replaceOp(op, {ret});
         return success();
       }
@@ -692,11 +718,14 @@ public:
     Value llVal = adaptor.getVal();
     Value llMask = adaptor.getMask();
 
-    auto valElements = unpackLLElements(loc, llVal, rewriter);
-    auto ptrElements = unpackLLElements(loc, llPtr, rewriter);
+    auto valElements =
+        unpackTensorElements(loc, llVal, rewriter, op.getVal().getType());
+    auto ptrElements =
+        unpackTensorElements(loc, llPtr, rewriter, op.getPtr().getType());
     SmallVector<Value> maskElements;
     if (llMask)
-      maskElements = unpackLLElements(loc, llMask, rewriter);
+      maskElements =
+          unpackTensorElements(loc, llMask, rewriter, op.getMask().getType());
 
     auto valueTy = op.getType();
     auto tensorTy = dyn_cast<RankedTensorType>(valueTy);
@@ -788,8 +817,9 @@ public:
         atomPtr = b.bitcast(atomPtr, ptr_ty(ctx, 3));
         // Only threads with rmwMask = True store the result
         targetInfo.storeShared(rewriter, loc, atomPtr, loadAcquireOp, pred);
-        createBarrier(rewriter, loc, numCTAs);
-        Value ret = b.load(valueElemTy, atomPtr);
+        createBarrier(rewriter, loc, numCTAs, op);
+        Value ret = loadScalarAtomicResult(rewriter, loc, targetInfo, atomPtr,
+                                           valueElemTy, numCTAs);
         rewriter.replaceOp(op, {ret});
         return success();
       }
@@ -923,8 +953,9 @@ public:
         atomPtr = b.bitcast(atomPtr, ptr_ty(ctx, 3));
         // Only threads with rmwMask = True store the result
         targetInfo.storeShared(rewriter, loc, atomPtr, *old, pred);
-        createBarrier(rewriter, loc, numCTAs);
-        Value ret = b.load(valueElemTy, atomPtr);
+        createBarrier(rewriter, loc, numCTAs, op);
+        Value ret = loadScalarAtomicResult(rewriter, loc, targetInfo, atomPtr,
+                                           valueElemTy, numCTAs);
         rewriter.replaceOp(op, {ret});
         return success();
       }
@@ -962,12 +993,12 @@ struct AsyncCopyGlobalToLocalOpConversion
     Value llMask = adaptor.getMask();
 
     // %src
-    auto srcElems = unpackLLElements(loc, llSrc, rewriter);
+    auto srcElems = unpackUniqueTensorElements(loc, llSrc, rewriter);
 
     // %mask
     SmallVector<Value> maskElems;
     if (llMask) {
-      maskElems = unpackLLElements(loc, llMask, rewriter);
+      maskElems = unpackUniqueTensorElements(loc, llMask, rewriter);
       assert(srcElems.size() == maskElems.size());
     }
 
@@ -975,7 +1006,7 @@ struct AsyncCopyGlobalToLocalOpConversion
     // %other
     // SmallVector<Value> otherElems;
     // if (llOther) {
-    //   otherElems = unpackLLElements(loc, llOther, rewriter);
+    //   otherElems = unpackTensorElements(loc, llOther, rewriter);
     //   assert(srcElems.size() == otherElems.size());
     // }
 
@@ -994,9 +1025,7 @@ struct AsyncCopyGlobalToLocalOpConversion
 
     // Remove broadcasted registers
     auto srcLayout = ttg::toLinearLayout(srcTy);
-    auto removeBroadcastSrc = actionRemoveBroadcastedRegs(srcLayout);
-    srcLayout = removeBroadcastSrc.apply(srcLayout);
-    vals = removeBroadcastSrc.apply(vals);
+    srcLayout = srcLayout.removeZeroBasesAlongDim(str_attr("register"));
 
     // We can load N elements at a time if:
     //  1. Every group of N source pointers are contiguous.  For example, if
@@ -1033,8 +1062,8 @@ struct AsyncCopyGlobalToLocalOpConversion
                            RewriterBase &rewriter, Location loc,
                            ArrayRef<Value> vals, Value shmemAddr, int startIdx,
                            VectorType vecTy,
-                           std::optional<Value> ctaId) -> SmallVector<Value> {
-      assert(!ctaId.has_value() && "cp.async does not support cross-cta loads");
+                           Value ctaId) -> SmallVector<Value> {
+      assert(!ctaId && "cp.async does not support cross-cta loads");
       assert(isa<VectorType>(vecTy));
       auto *ctx = rewriter.getContext();
       auto elemTy = vecTy.getElementType();
@@ -1085,7 +1114,8 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto maskSpanAffineOffset = SharedMemoryObject::getMaskSpanOffsets(dstTy);
     auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
     lowerLdSt(loc, ctx, cvt, vals, resElemTy, smemObj.getBase(),
-              /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset, laneId,
+              /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
+              /*affineBlockOffset=*/Value(), /*maskSpanAffineBlock=*/0, laneId,
               warpId, rewriter, targetInfo, maxVec, emitCpAsync);
 
     // Drop the result token.
@@ -1191,7 +1221,6 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     auto kMsg = str_attr("msg");
     auto kBlock = str_attr("block");
     const auto numCopies = msgToOffset.getInDimSize(kMsg);
-    auto zero = b.i32_val(0);
     auto ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
     // We multicast if the flag is on and the block layout has broadcasting
     bool multicast = op.getMulticast();
@@ -1210,17 +1239,20 @@ struct AsyncTMACopyGlobalToLocalOpConversion
 
     uint32_t barrierMask =
         toLinearLayout(barrierTy).getFreeVariableMasks().lookup(kBlock);
-    // We emit a cluster-level barrier when the barrier mask is set.
-    bool clusterBarrier = barrierMask != 0;
-    if (clusterBarrier) {
+    // Use a cross-CTA mbarrier pointer when the barrier mask is set.
+    bool crossCTABarrier = barrierMask != 0;
+    if (crossCTABarrier) {
       barrierPtr =
           LLVM::NVIDIA::getLeaderAddress(loc, rewriter, barrierPtr, barrierTy);
     }
 
-    // Don't set cta_group::1 as it doesn't exist pre-Blackwell
     std::string ctaGroup;
     if (getModuleTwoCTAs(op)) {
-      ctaGroup = "cta_group::2.";
+      auto oneCTACGALayout = ttg::CGAEncodingAttr::get1DLayout(
+          op->getContext(), ttg::lookupNumCTAs(op));
+      bool oneCTABarrier =
+          getCGALayout(barrierTy.getEncoding()) == oneCTACGALayout;
+      ctaGroup = oneCTABarrier ? "cta_group::1." : "cta_group::2.";
     }
 
     // The bounding box inner dimension must be less than or equal to the
@@ -1240,7 +1272,7 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       Value copyIdxVal = b.add(warpID, b.i32_val(copyIdx));
       Value shMemOffset =
           applyLinearLayout(loc, rewriter, msgToShared,
-                            {{kMsg, copyIdxVal}, {kBlock, zero}})[0]
+                            {{kMsg, copyIdxVal}, {kBlock, ctaId}})[0]
               .second;
       Value shMemPtr = b.gep(elemPtrTy, llvmElemTy, dstBase, shMemOffset);
       SmallVector<PTXBuilder::Operand *> operands = {
@@ -1249,7 +1281,7 @@ struct AsyncTMACopyGlobalToLocalOpConversion
           ptxBuilderTMA.newOperand(adaptor.getDesc(), "l")};
       std::string tmaInst =
           "@$0 cp.async.bulk.tensor." + std::to_string(rank) + "d." + ctaGroup +
-          "shared::" + ((clusterBarrier || multicast) ? "cluster" : "cta") +
+          "shared::" + ((crossCTABarrier || multicast) ? "cluster" : "cta") +
           ".global" + (isIm2Col ? ".im2col" : "") +
           ".mbarrier::complete_tx::bytes";
       if (multicast)
@@ -1344,6 +1376,14 @@ LogicalResult convertTMAStoreLikeOp(Operation *op,
   auto numCopies = msgToOffset.getInDimSize(kMsg);
   auto zero = b.i32_val(0);
   auto ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+  uint32_t maskCGABroadcast = smemLayout.getFreeVariableMasks().lookup(kBlock);
+  if (maskCGABroadcast != 0) {
+    // Stores and reductions operate from CTA-local shared memory, so if the
+    // source tile is broadcast across CTAs only the lead CTA should issue the
+    // TMA message.
+    Value ctaIdInGroup = b.and_(ctaId, b.i32_val(maskCGABroadcast));
+    pred = b.and_(pred, b.icmp_eq(ctaIdInGroup, zero));
+  }
 
   for (int copyIdx = 0; copyIdx < numCopies; copyIdx += numWarps) {
     int numWarpsToCopy = std::min(numCopies - copyIdx, numWarps);
@@ -1356,7 +1396,7 @@ LogicalResult convertTMAStoreLikeOp(Operation *op,
     Value copyIdxVal = b.add(warpID, b.i32_val(copyIdx));
     Value shMemOffset =
         applyLinearLayout(loc, rewriter, msgToShared,
-                          {{kMsg, copyIdxVal}, {kBlock, zero}})[0]
+                          {{kMsg, copyIdxVal}, {kBlock, ctaId}})[0]
             .second;
     Value shMemPtr = b.gep(elemPtrTy, llvmElemTy, dstBase, shMemOffset);
     SmallVector<PTXBuilder::Operand *> operands = {
@@ -1527,6 +1567,8 @@ static LogicalResult iterateGatherScatterIndices(
   LinearLayout msgToCol =
       LinearLayout::strided1D(numMessagesPerRow, msgSize, kMsg, kDim1);
   LinearLayout msgLayout = xCoordsLayout * msgToCol;
+  LinearLayout msgToOffset =
+      getMsgToPackedOffsetLayout(smemType, ttg::TMAMode::Tiled);
 
   // `gather4` will put the segments of the 4 rows consecutively in
   // shared memory. However, if the 4 rows are smaller than the shared memory
@@ -1545,6 +1587,10 @@ static LogicalResult iterateGatherScatterIndices(
 
   Value warpId = mlir::triton::gpu::WarpIdOp::create(rewriter, loc);
   Value blockId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+  auto ctaOffsets = applyLinearLayout(
+      loc, rewriter, msgToOffset, {{kMsg, b.i32_val(0)}, {kBlock, blockId}});
+  assert(ctaOffsets.size() == 2 && ctaOffsets.back().first == kDim1);
+  yOffsetValue = b.add(yOffsetValue, ctaOffsets.back().second);
 
   // Mask out warps with redundant x offsets.
   pred = b.and_(pred,
@@ -1552,7 +1598,8 @@ static LogicalResult iterateGatherScatterIndices(
   // Select one thread in each warp to issue the gather4 messages.
   pred = b.and_(pred, LLVM::NVIDIA::createElectPredicate(loc, rewriter));
 
-  SmallVector<Value> xOffsets = unpackLLElements(loc, xOffsetsValue, rewriter);
+  SmallVector<Value> xOffsets =
+      unpackTensorElements(loc, xOffsetsValue, rewriter, xCoords.getType());
   // Lane ID doesn't matter.
   Value laneId = b.i32_val(0);
   for (auto regId : seq<unsigned>(0, xOffsets.size(), 4)) {
@@ -1598,19 +1645,60 @@ LogicalResult AsyncTMAGatherOpConversion::matchAndRewrite(
     triton::nvidia_gpu::AsyncTMAGatherOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
   Location loc = op.getLoc();
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
 
   LLVM::LLVMVoidType voidTy = void_ty(op->getContext());
+  auto barrierTy = op.getBarrier().getType();
   auto barrierMemObj = LLVM::getSharedMemoryObjectFromStruct(
       loc, adaptor.getBarrier(),
-      typeConverter->convertType(op.getBarrier().getType().getElementType()),
-      rewriter);
+      typeConverter->convertType(barrierTy.getElementType()), rewriter);
+
+  auto kBlock = StringAttr::get(op.getContext(), "block");
+  bool multicast = op.getMulticast();
+  Value pred = adaptor.getPred();
+  Value multicastMask;
+  if (multicast) {
+    uint32_t maskCGABroadcast = ttg::toLinearLayout(op.getResult().getType())
+                                    .getFreeVariableMasks()
+                                    .lookup(kBlock);
+    multicastMask =
+        LLVM::NVIDIA::createTMAMulticastMask(loc, rewriter, maskCGABroadcast);
+    Value ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+    Value ctaIdInGroup = b.and_(ctaId, b.i32_val(maskCGABroadcast));
+    pred = b.and_(pred, b.icmp_eq(ctaIdInGroup, b.i32_val(0)));
+  }
+
+  Value barrierPtr = barrierMemObj.getBase();
+  bool crossCTABarrier =
+      toLinearLayout(barrierTy).getFreeVariableMasks().lookup(kBlock) != 0;
+  if (crossCTABarrier) {
+    barrierPtr =
+        LLVM::NVIDIA::getLeaderAddress(loc, rewriter, barrierPtr, barrierTy);
+  }
+
+  std::string ctaGroup;
+  if (getModuleTwoCTAs(op)) {
+    auto oneCTACGALayout = ttg::CGAEncodingAttr::get1DLayout(
+        op->getContext(), ttg::lookupNumCTAs(op));
+    bool oneCTABarrier =
+        getCGALayout(barrierTy.getEncoding()) == oneCTACGALayout;
+    ctaGroup = oneCTABarrier ? ".cta_group::1" : ".cta_group::2";
+  }
 
   // Callback to generate the gather4 instruction.
   auto callback = [&](Value pred, Value shMemPtr, Value yOffset,
                       ArrayRef<Value> xOffsets) {
-    std::string tmaInst = "@$0 cp.async.bulk.tensor.2d.tile::gather4.shared"
-                          "::cta.global.mbarrier::complete_tx::bytes "
-                          "[$1], [$2, {$3, $4, $5, $6, $7}], [$8];";
+    std::string tmaInst = "@$0 cp.async.bulk.tensor.2d.tile::gather4";
+    tmaInst += ctaGroup;
+    tmaInst += ".shared::";
+    tmaInst += (crossCTABarrier || multicast) ? "cluster" : "cta";
+    tmaInst += ".global.mbarrier::complete_tx::bytes";
+    if (multicast)
+      tmaInst += ".multicast::cluster";
+    tmaInst += " [$1], [$2, {$3, $4, $5, $6, $7}], [$8]";
+    if (multicast)
+      tmaInst += ", $9";
+    tmaInst += ";";
 
     PTXBuilder ptxBuilder;
     SmallVector<PTXBuilder::Operand *, 9> operands{
@@ -1623,7 +1711,9 @@ LogicalResult AsyncTMAGatherOpConversion::matchAndRewrite(
     };
     for (Value xOffset : xOffsets)
       operands.push_back(ptxBuilder.newOperand(xOffset, "r"));
-    operands.push_back(ptxBuilder.newOperand(barrierMemObj.getBase(), "r"));
+    operands.push_back(ptxBuilder.newOperand(barrierPtr, "r"));
+    if (multicast)
+      operands.push_back(ptxBuilder.newOperand(multicastMask, "h"));
 
     auto &tma = *ptxBuilder.create(tmaInst);
     tma(operands, /*attachOnlyMLIRArgs=*/true);
@@ -1633,7 +1723,7 @@ LogicalResult AsyncTMAGatherOpConversion::matchAndRewrite(
   if (failed(iterateGatherScatterIndices(
           op, rewriter, *getTypeConverter(), op.getXOffsets(), op.getResult(),
           adaptor.getResult(), adaptor.getXOffsets(), adaptor.getYOffset(),
-          adaptor.getPred(), callback)))
+          pred, callback)))
     return failure();
 
   rewriter.eraseOp(op);
@@ -1655,6 +1745,18 @@ LogicalResult AsyncTMAScatterOpConversion::matchAndRewrite(
   Location loc = op.getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   LLVM::LLVMVoidType voidTy = void_ty(op->getContext());
+  auto kBlock = StringAttr::get(op.getContext(), "block");
+  Value pred = b.true_val();
+  uint32_t maskCGABroadcast = ttg::toLinearLayout(op.getSrc().getType())
+                                  .getFreeVariableMasks()
+                                  .lookup(kBlock);
+  if (maskCGABroadcast != 0) {
+    // `scatter4` only reads from the current CTA's shared memory, so if the
+    // source is broadcast across CTAs only the lead CTA should issue it.
+    Value ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+    Value ctaIdInGroup = b.and_(ctaId, b.i32_val(maskCGABroadcast));
+    pred = b.icmp_eq(ctaIdInGroup, b.i32_val(0));
+  }
 
   // Callback to generate the scatter4 instruction.
   auto callback = [&](Value pred, Value shMemPtr, Value yOffset,
@@ -1682,8 +1784,8 @@ LogicalResult AsyncTMAScatterOpConversion::matchAndRewrite(
 
   if (failed(iterateGatherScatterIndices(
           op, rewriter, *getTypeConverter(), op.getXOffsets(), op.getSrc(),
-          adaptor.getSrc(), adaptor.getXOffsets(), adaptor.getYOffset(),
-          /*pred=*/b.true_val(), callback)))
+          adaptor.getSrc(), adaptor.getXOffsets(), adaptor.getYOffset(), pred,
+          callback)))
     return failure();
 
   // TODO: Separate the syncronizations operations into separate TTGIR ops to
@@ -1759,10 +1861,8 @@ struct TMAStoreWaitOpConversion
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::TMAStoreWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto ctx = op.getContext();
-    auto isRead = UnitAttr::get(ctx);
     rewriter.replaceOpWithNewOp<NVVM::CpAsyncBulkWaitGroupOp>(
-        op, op.getPendingsAttr(), isRead);
+        op, op.getPendingsAttr(), op.getReadOnlyAttr());
     return success();
   }
 };

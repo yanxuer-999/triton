@@ -12,6 +12,7 @@
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonInstrument/IR/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/LayoutUtils.h"
 #include <limits>
 
 namespace {
@@ -86,20 +87,14 @@ struct BufferDescriptorsOpConversion
     auto lengths = adaptor.getLengths();
     assert(offsets.size() == lengths.size() && "Mismatched descriptor arrays");
 
-    auto totalTensorType = cast<RankedTensorType>(op.getResult().getType());
-    // The totalEncoding is of shape [CTAs, Descriptors]
-    auto totalEncoding =
-        cast<ttg::DistributedEncodingTrait>(totalTensorType.getEncoding());
-    assert(totalTensorType.getRank() == 2 &&
-           "descriptor tables must have shape [cta, descriptor]");
+    auto tensorType = cast<RankedTensorType>(op.getResult().getType());
+    auto encoding =
+        cast<ttg::DistributedEncodingTrait>(tensorType.getEncoding());
+    assert(tensorType.getRank() == 1 &&
+           "descriptor tables must have shape [descriptor]");
     assert(static_cast<int64_t>(offsets.size()) ==
-               totalTensorType.getShape().back() &&
+               tensorType.getShape().back() &&
            "Descriptor data must match the descriptor dimension");
-    // Get a slice of shape [Descriptors] that will be broadcasted at the end
-    auto encoding = tti::getSingleDimSliceEncoding(totalEncoding, /*dim=*/1);
-    auto tensorType =
-        RankedTensorType::get({totalTensorType.getShape().back()},
-                              totalTensorType.getElementType(), encoding);
 
     SmallVector<uint64_t> offsetVals;
     offsetVals.reserve(offsets.size());
@@ -146,9 +141,6 @@ struct BufferDescriptorsOpConversion
     Value bufDescriptors =
         arith::OrIOp::create(rewriter, loc, trimmedPointers.getType(),
                              trimmedPointers, lengthTensor);
-    bufDescriptors = tti::expandOuterSlicedDim(rewriter, loc, bufDescriptors);
-    bufDescriptors = triton::BroadcastOp::create(rewriter, loc, totalTensorType,
-                                                 bufDescriptors);
     rewriter.replaceOp(op, bufDescriptors);
     return success();
   }
@@ -298,7 +290,7 @@ struct LockReleaseOpConversion
       auto *ptrOpr = ptx.newAddrOperand(adaptor.getLock(), "l");
       auto *valOpr = ptx.newOperand(zero, "r");
       auto &atom = *ptx.create("atom");
-      atom.global().o("acq_rel").o("gpu").o("exch").o("b32");
+      atom.global().o("release").o("gpu").o("exch").o("b32");
       atom(dstOpr, ptrOpr, valOpr).predicate(elect);
       ptx.launch(b, loc, i32);
     } else {
@@ -356,6 +348,101 @@ private:
   const TargetInfoBase &targetInfo;
 };
 
+static SmallVector<std::pair<Value, Value>>
+computeLocalOffsetsWithLogicalOffsets(Location loc, ttg::MemDescType memDescTy,
+                                      RankedTensorType regTy,
+                                      ArrayRef<Value> idxValues, unsigned axis,
+                                      ArrayRef<Value> offsets,
+                                      RewriterBase &rewriter,
+                                      const TargetInfoBase &targetInfo) {
+  MLIRContext *ctx = memDescTy.getContext();
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto sharedLayout = ttg::isPaddedEncoding(memDescTy.getEncoding())
+                          ? ttg::paddedLinearLayout(memDescTy)
+                          : ttg::toLinearLayout(memDescTy);
+  LinearLayout invSharedLayout = sharedLayout.pseudoinvert();
+  auto allDims = tt::standardOutDimNames(ctx, memDescTy.getRank());
+  auto kOffset = str_attr("offset");
+  auto kBlock = str_attr("block");
+  bool crossCTA = invSharedLayout.getOutDimSize(kBlock) > 1;
+  assert(offsets.size() == allDims.size());
+
+  auto regLayout = ttg::toLinearLayout(regTy);
+  auto coords = emitIndices(loc, rewriter, targetInfo, regLayout, regTy,
+                            /*withCTAOffset=*/true);
+  SmallVector<std::pair<Value, Value>> offsetAndBlock;
+  offsetAndBlock.reserve(idxValues.size());
+  for (auto [coords, idxVal] : llvm::zip(coords, idxValues)) {
+    Value idx = idxVal;
+    unsigned idxWidth = idx.getType().getIntOrFloatBitWidth();
+    if (idxWidth > 32)
+      idx = b.trunc(i32_ty, idx);
+    else if (idxWidth < 32)
+      idx = b.zext(i32_ty, idx);
+
+    SmallVector<Value> indices(coords);
+    indices[axis] = idx;
+    for (auto [dim, offset] : llvm::enumerate(offsets))
+      indices[dim] = b.add(indices[dim], offset);
+
+    SmallVector<std::pair<StringAttr, Value>> inputs;
+    for (auto [dim, index] : llvm::zip(allDims, indices))
+      inputs.push_back({dim, index});
+    auto outputs = applyLinearLayout(loc, rewriter, invSharedLayout, inputs);
+    assert(outputs.size() == 2);
+    assert(outputs[0].first == kOffset && outputs[1].first == kBlock);
+    offsetAndBlock.push_back(
+        {outputs[0].second, crossCTA ? outputs[1].second : Value()});
+  }
+  return offsetAndBlock;
+}
+
+struct LocalGatherOpConversion
+    : public ConvertOpToLLVMPattern<tti::ExperimentalLocalGatherOp> {
+  LocalGatherOpConversion(const LLVMTypeConverter &converter,
+                          const TargetInfoBase &targetInfo,
+                          PatternBenefit benefit = 1)
+      : ConvertOpToLLVMPattern<tti::ExperimentalLocalGatherOp>(converter,
+                                                               benefit),
+        targetInfo(targetInfo) {}
+
+  LogicalResult
+  matchAndRewrite(tti::ExperimentalLocalGatherOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto memDescTy = cast<ttg::MemDescType>(op.getSrc().getType());
+    auto regTy = cast<RankedTensorType>(op.getType());
+    auto typeConverter = getTypeConverter();
+
+    Type llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
+    auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
+                                                         llvmElemTy, rewriter);
+    auto idxValues = unpackTensorElements(loc, adaptor.getIndices(), rewriter,
+                                          op.getIndices().getType());
+    SmallVector<Value> offsets(adaptor.getOffsets());
+
+    auto offsetAndBlock = computeLocalOffsetsWithLogicalOffsets(
+        loc, memDescTy, regTy, idxValues, op.getAxis(), offsets, rewriter,
+        targetInfo);
+    auto addrs = materializeLocalAddrs(loc, memDescTy, smemObj, llvmElemTy,
+                                       offsetAndBlock, rewriter);
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    SmallVector<Value> results =
+        llvm::map_to_vector(addrs, [&](const LocalSharedMemoryAddress &addr) {
+          return targetInfo.loadDShared(rewriter, loc, addr.ptr, addr.ctaId,
+                                        llvmElemTy, b.true_val());
+        });
+    Value result =
+        packTensorElements(loc, typeConverter, results, rewriter, regTy);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+
+private:
+  const TargetInfoBase &targetInfo;
+};
+
 } // namespace
 
 void mlir::triton::populateInstrumentationToLLVMPatterns(
@@ -367,4 +454,5 @@ void mlir::triton::populateInstrumentationToLLVMPatterns(
   patterns.add<LockReleaseOpConversion>(typeConverter, targetInfo);
   patterns.add<MemDescToI32OpConversion>(typeConverter);
   patterns.add<ClusterCTAIdOpConversion>(typeConverter, targetInfo);
+  patterns.add<LocalGatherOpConversion>(typeConverter, targetInfo);
 }

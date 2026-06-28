@@ -12,20 +12,33 @@
 namespace mlir::triton::instrument {
 
 struct MemEffectsOpInfo {
-  // Frontier: snapshot thread-visible frontier into barrier tracking.
-  // EffectWrites: track only buffers written by op effects.
+  // Controls which memory effects become visible to a CTA after it waits on
+  // this barrier.
+  //
+  // Frontier snapshots the issuing thread's current visibility frontier into
+  // the barrier. A later wait publishes whatever shared/tensor memory writes
+  // and reads were visible to that logical thread before the arrive/commit. Use
+  // this for ordering operations whose semantics are a release of prior work.
+  //
+  // EffectWrites does not snapshot the whole thread frontier. Instead, it
+  // attaches only the explicit write effects of this op to the barrier. A later
+  // wait publishes those op-local writes and nothing else. Use this for PTX ops
+  // that perform the write and also signal the barrier via
+  // `mbarrier::complete_tx`.
   enum class BarrierTrackingMode {
     Frontier,
     EffectWrites,
   };
   struct Effects {
     enum RW { Read, Write } rw;
+    enum class Proxy { Generic, Async } proxy;
     Value buf;
     std::string operandName = "";
     uint32_t length = 0;
 
-    Effects(RW rw, Value buf, std::string operandName = "")
-        : rw(rw), buf(buf), operandName(operandName),
+    Effects(RW rw, Value buf, std::string operandName = "",
+            Proxy proxy = Proxy::Generic)
+        : rw(rw), proxy(proxy), buf(buf), operandName(operandName),
           length(getMemDescLength(buf)) {}
   };
   struct BarrierInfo {
@@ -72,6 +85,10 @@ struct WaitOpInfo {
   bool transferReads;
 };
 
+struct AsyncProxyFenceInfo {
+  bool cluster;
+};
+
 struct CommitKindDesc {
   CommitKind::Kind kind;
   std::string operationDesc;
@@ -83,6 +100,8 @@ public:
 
   virtual bool isTMAOp(Operation *op) const = 0;
 
+  virtual bool isCLCOp(Operation *op) const { return false; }
+
   virtual std::optional<BarrierInitInfo>
   getBarrierInitInfo(Operation *op) const = 0;
 
@@ -93,6 +112,15 @@ public:
   getBarrierInvalidateInfo(Operation *op) const = 0;
 
   virtual std::optional<WaitOpInfo> getWaitOpInfo(Operation *op) const = 0;
+
+  virtual std::optional<AsyncProxyFenceInfo>
+  getAsyncProxyFenceInfo(Operation *op) const {
+    return std::nullopt;
+  }
+
+  virtual bool needsAsyncProxyFenceTracking(ModuleOp module) const {
+    return false;
+  }
 
   virtual Value getIssuerCTAPred(ImplicitLocOpBuilder &b,
                                  Operation *op) const = 0;
@@ -158,7 +186,8 @@ public:
   getRequiredCommitKinds(ModuleOp module) const = 0;
 };
 
-void runConcurrencySanitizer(ModuleOp module, const ConSanTargetHooks *hooks);
+LogicalResult runConcurrencySanitizer(ModuleOp module,
+                                      const ConSanTargetHooks *hooks);
 
 using ConSanHooksFactory = std::function<std::unique_ptr<ConSanTargetHooks>()>;
 void registerConSanHooks(llvm::StringRef key, ConSanHooksFactory factory);

@@ -27,8 +27,8 @@ using ::mlir::LLVM::getSharedMemoryBase;
 using ::mlir::LLVM::AMD::getVectorSize;
 using ::mlir::LLVM::AMD::llLoad;
 using ::mlir::LLVM::AMD::llStore;
-using ::mlir::triton::AMD::ISAFamily;
 using ::mlir::triton::gpu::getTotalElemsPerThread;
+using triton::amdgpu::ISAFamily;
 
 namespace {
 
@@ -199,6 +199,19 @@ std::pair<Block *, Block *> emitBranch(RewriterBase &rewriter, Location loc,
   return {body, after};
 }
 
+bool isRedundantThreadPredWarpUniform(
+    const llvm::MapVector<StringAttr, int32_t> &masks, MLIRContext *ctx) {
+  return masks.lookup(StringAttr::get(ctx, "lane")) == 0 &&
+         masks.lookup(StringAttr::get(ctx, "reg")) == 0;
+}
+
+Value selectLdsAddressForPredicate(TritonLLVMOpBuilder &b, Value pred,
+                                   Value shmemAddr) {
+  Value outOfRangeAddress =
+      b.inttoptr(shmemAddr.getType(), b.i32_val(0x7FFFFFFF));
+  return b.select(pred, shmemAddr, outOfRangeAddress);
+}
+
 // Contains some helper functions for both Load and Store conversions.
 struct LoadStoreConversionBase {
   explicit LoadStoreConversionBase(const AMD::TargetInfo &targetInfo,
@@ -252,7 +265,7 @@ struct LoadStoreConversionBase {
     SmallVector<Value> maskElems;
     if (llMask) {
       vec = std::min<size_t>(vec, getMaskAlignment(mask));
-      maskElems = unpackLLElements(loc, llMask, rewriter);
+      maskElems = unpackTensorElements(loc, llMask, rewriter, mask.getType());
     }
     return maskElems;
   }
@@ -474,22 +487,22 @@ struct DirectToLdsLoadConversionBase : public LoadStoreConversionBase {
 
     auto lowerInstForwardMulticastMask =
         [&](RewriterBase &rewriter, Location loc, ArrayRef<Value> vals,
-            Value shmemAddr, int idx, VectorType vecTy,
-            std::optional<Value> ctaId) {
-          assert(!ctaId.has_value() && "NYI");
+            Value shmemAddr, int idx, VectorType vecTy, Value ctaId) {
+          assert(!ctaId && "NYI");
           return lowerInst(rewriter, loc, vals, shmemAddr, idx, vecTy,
                            ctaMulticastMask);
         };
 
     // For loads on GFX9 (no scattering support), the address should be the
     // start address (scalar) of the warp
-    if (isLoad && !targetInfo.supportsDirectToLDSScattering()) {
+    if (isLoad && !targetInfo.supportsDirectToLdsScatter()) {
       laneId = b.i32_val(0);
     }
 
     lowerLdSt(loc, ctx, cvt, vals, resElemTy, smemObj.getBase(), paddingShifts,
-              affineOffset, maskSpanAffineOffset, laneId, warpId, rewriter,
-              targetInfo, vec, lowerInstForwardMulticastMask);
+              affineOffset, maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
+              /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
+              vec, lowerInstForwardMulticastMask);
     return success();
   }
 
@@ -505,11 +518,23 @@ struct DirectToLdsLoadConversionBase : public LoadStoreConversionBase {
     Value ldsAddr = shmemAddr;
     // When scattering is unsupported, shmemAddr is the warp base address.
     // Use shmemAddr + lane_id [+ swizzleOffset] to compute each lane's address.
-    if (!targetInfo.supportsDirectToLDSScattering()) {
+    if (!targetInfo.supportsDirectToLdsScatter()) {
       ldsAddr = b.gep(ptrTy, vecTy, shmemAddr, laneId);
       if (requiresSrcPtrSwizzling)
         ldsAddr = b.gep(ptrTy, vecTy, ldsAddr, swizzleLaneOffset);
     }
+
+    // For architectures supporting scattering to LDS we mask without a branch
+    // so we also mask the local writes by selecting OOB LDS address to avoid
+    // adding a branch just for other writes
+    if (targetInfo.supportsDirectToLdsScatter()) {
+      auto invMask = b.icmp_ne(mask, b.true_val());
+      ldsAddr = selectLdsAddressForPredicate(b, invMask, shmemAddr);
+      // Set the mask to false since we mask via the LDS address. False mask
+      // means that others values are written to LDS, see icmp_ne below
+      mask = b.false_val();
+    }
+
     llStore(rewriter, loc, ldsAddr, storeVal, b.icmp_ne(mask, b.true_val()),
             CacheModifier::NONE, targetInfo.requiresAliasInfoForAsyncOps());
   }
@@ -547,7 +572,7 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
     unsigned numElems = getTotalElemsPerThread(ptr.getType());
 
     // Get the LLVM values for pointers
-    auto ptrElems = unpackLLElements(loc, llPtr, rewriter);
+    auto ptrElems = unpackTensorElements(loc, llPtr, rewriter, ptr.getType());
     assert(ptrElems.size() == numElems);
 
     // Get the LLVM values for mask
@@ -556,7 +581,8 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
 
     SmallVector<Value> otherElems;
     if (other)
-      otherElems = unpackLLElements(loc, llOther, rewriter);
+      otherElems =
+          unpackTensorElements(loc, llOther, rewriter, other.getType());
 
     Value multicastMask;
     if (targetInfo.supportsMultiCTALaunch()) {
@@ -604,9 +630,8 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
       }
     } // end vec
 
-    Type llvmResultStructTy = getTypeConverter()->convertType(valueTy);
-    Value resultStruct = packLLElements(loc, getTypeConverter(), loadedVals,
-                                        rewriter, llvmResultStructTy);
+    Value resultStruct = packTensorElements(loc, getTypeConverter(), loadedVals,
+                                            rewriter, valueTy);
 
     rewriter.replaceOp(op, {resultStruct});
     return success();
@@ -654,7 +679,8 @@ struct BufferLoadOpConversion
     vec = std::max(vec, op.getContiguity());
 
     // Get the offset
-    SmallVector<Value> offsetElems = unpackLLElements(loc, llOffset, rewriter);
+    SmallVector<Value> offsetElems =
+        unpackTensorElements(loc, llOffset, rewriter, offset.getType());
     assert(offsetElems.size() == numElems);
 
     // Get the mask
@@ -664,7 +690,8 @@ struct BufferLoadOpConversion
     // Get the `other` value (if any)
     SmallVector<Value> otherElems;
     if (llOther)
-      otherElems = unpackLLElements(loc, llOther, rewriter);
+      otherElems =
+          unpackTensorElements(loc, llOther, rewriter, op.getOther().getType());
 
     // Create the resource descriptor and then emit the buffer_load intrinsic(s)
     Value rsrcDesc = bufferEmitter.createResourceDescriptor(llPtr, llStride);
@@ -687,9 +714,8 @@ struct BufferLoadOpConversion
       }
     } // end vec
 
-    Type llvmResultStructTy = getTypeConverter()->convertType(valueTy);
-    Value resultStruct = packLLElements(loc, getTypeConverter(), loadedVals,
-                                        rewriter, llvmResultStructTy);
+    Value resultStruct = packTensorElements(loc, getTypeConverter(), loadedVals,
+                                            rewriter, valueTy);
 
     rewriter.replaceOp(op, {resultStruct});
     return success();
@@ -739,10 +765,12 @@ struct BufferLoadToLocalOpConversion
     SmallVector<Value> maskElems =
         getMaskElemsAndUpdateVeclen(rewriter, loc, llMask, mask, vec);
 
-    SmallVector<Value> offsetElems = unpackLLElements(loc, llOffset, rewriter);
+    SmallVector<Value> offsetElems =
+        unpackTensorElements(loc, llOffset, rewriter, offset.getType());
     SmallVector<Value> otherElems;
     if (llOther)
-      otherElems = unpackLLElements(loc, llOther, rewriter);
+      otherElems =
+          unpackTensorElements(loc, llOther, rewriter, op.getOther().getType());
 
     auto dstTy = op.getDest().getType();
     auto resElemTy = getTypeConverter()->convertType(dstTy.getElementType());
@@ -762,9 +790,9 @@ struct BufferLoadToLocalOpConversion
     SmallVector<Value> swizzledLaneOffsets;
 
     auto maybeSwizzledEnc = dyn_cast<SwizzledSharedEncodingAttr>(dstEnc);
-    bool requiresSrcPtrSwizzling =
-        !targetInfo.supportsDirectToLDSScattering() && maybeSwizzledEnc &&
-        maybeSwizzledEnc.getMaxPhase() != 1;
+    bool requiresSrcPtrSwizzling = !targetInfo.supportsDirectToLdsScatter() &&
+                                   maybeSwizzledEnc &&
+                                   maybeSwizzledEnc.getMaxPhase() != 1;
     if (requiresSrcPtrSwizzling) {
       // TODO (alex): this is only correct as long as the lds view is a
       // contiguous block. So this can break if we slice along the 2 minor
@@ -790,16 +818,17 @@ struct BufferLoadToLocalOpConversion
     // based on the collected shared addresses and vector size
     Value rsrcDesc = bufferEmitter.createResourceDescriptor(llPtr, llStride);
 
+    auto freeVarMasks = getFreeVariableMasks(ptrType);
     Value threadPred = emitRedundantThreadPredicateNonNull(
-        getFreeVariableMasks(ptrType), rewriter, loc, targetInfo);
+        freeVarMasks, rewriter, loc, targetInfo);
+    bool isThreadPredWarpUniform =
+        isRedundantThreadPredWarpUniform(freeVarMasks, rewriter.getContext());
 
-    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
-    auto emitBufferLoadLds =
-        [this, &op, &b, &bufferEmitter, &rsrcDesc, laneId = laneId, threadPred,
-         offsetTy, otherTy, hasOther, requiresSrcPtrSwizzling](
-            RewriterBase &rewriter, Location loc, ArrayRef<Value> loadVals,
-            Value shmemAddr, int startIdx, VectorType vecTy,
-            Value multicastMask) -> SmallVector<Value> {
+    auto laneId = getLaneId(rewriter, loc);
+    auto emitBufferLoadLds = [&](RewriterBase &rewriter, Location loc,
+                                 ArrayRef<Value> loadVals, Value shmemAddr,
+                                 int startIdx, VectorType vecTy,
+                                 Value multicastMask) -> SmallVector<Value> {
       auto [offsetElem, maskElem, otherElems, swizzleLaneOffset] =
           unzipAsyncCopyValues(rewriter, loc, startIdx, loadVals, offsetTy,
                                otherTy, hasOther, vecTy.getNumElements());
@@ -812,27 +841,41 @@ struct BufferLoadToLocalOpConversion
         applySwizzling(rewriter, loc, offsetElem, maybeSwizzledMaskElem, laneId,
                        swizzleLaneOffset);
 
-      // If other=0.0 we remove other in canonicalizePointers and we can use out
-      // of bounds to store 0 to LDS. So if we have other values we need to
-      // predicate to not overwrite the other stores
-      Value cond =
-          hasOther ? b.and_(threadPred, maybeSwizzledMaskElem) : threadPred;
+      // Buffer-load-to-local supports zero-fill for per-lane masks by adjusting
+      // the src offset to be OOB. Redundant-thread predication still needs a
+      // branch when there are other values, otherwise inactive threads
+      // zero-fill values loaded by active lanes from another warp.
+      // Optimization: for warp-uniform thread predicates and no other values we
+      // can avoid the branch by selecting an out-of-range *shared* address. The
+      // HW will drop the load before fetching the data from global memory so we
+      // will not overwrite values.
+      if (isThreadPredWarpUniform && !hasOther) {
+        Value predicatedAddress =
+            selectLdsAddressForPredicate(b, threadPred, shmemAddr);
+        auto bufferLoadToLds = bufferEmitter.emitLoadToLds(
+            vecTy, vecBytesVal, rsrcDesc, offsetElem, predicatedAddress,
+            maybeSwizzledMaskElem, op.getCache());
+        if (targetInfo.requiresAliasInfoForAsyncOps())
+          AMD::addAsyncCopyAliasScope(bufferLoadToLds);
+      } else {
+        Value pred =
+            hasOther ? b.and_(threadPred, maybeSwizzledMaskElem) : threadPred;
+        auto [loadBlock, afterLoadBlock] = emitBranch(rewriter, loc, pred);
 
-      auto [loadBlock, afterLoadBlock] = emitBranch(rewriter, loc, cond);
+        auto bufferLoadToLds = bufferEmitter.emitLoadToLds(
+            vecTy, vecBytesVal, rsrcDesc, offsetElem, shmemAddr,
+            hasOther ? b.true_val() : maybeSwizzledMaskElem, op.getCache());
+        if (targetInfo.requiresAliasInfoForAsyncOps())
+          AMD::addAsyncCopyAliasScope(bufferLoadToLds);
 
-      auto bufferLoadToLds = bufferEmitter.emitLoadToLds(
-          vecTy, vecBytesVal, rsrcDesc, offsetElem, shmemAddr,
-          hasOther ? b.true_val() : maybeSwizzledMaskElem, op.getCache());
-      if (targetInfo.requiresAliasInfoForAsyncOps())
-        AMD::addAsyncCopyAliasScope(bufferLoadToLds);
+        if (hasOther) {
+          emitOtherStore(rewriter, loc, this->getTypeConverter(), vecTy,
+                         maskElem, otherElems, shmemAddr, laneId,
+                         requiresSrcPtrSwizzling, swizzleLaneOffset);
+        }
 
-      if (hasOther) {
-        emitOtherStore(rewriter, loc, this->getTypeConverter(), vecTy, maskElem,
-                       otherElems, shmemAddr, laneId, requiresSrcPtrSwizzling,
-                       swizzleLaneOffset);
+        rewriter.setInsertionPointToStart(afterLoadBlock);
       }
-
-      rewriter.setInsertionPointToStart(afterLoadBlock);
 
       return {};
     };
@@ -886,10 +929,12 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto maskElements = getMaskElemsAndUpdateVeclen(
         rewriter, loc, adaptor.getMask(), op.getMask(), vec);
 
-    auto srcElems = unpackLLElements(loc, adaptor.getSrc(), rewriter);
+    auto srcElems = unpackTensorElements(loc, adaptor.getSrc(), rewriter,
+                                         op.getSrc().getType());
     SmallVector<Value> otherElems;
     if (op.getOther())
-      otherElems = unpackLLElements(loc, adaptor.getOther(), rewriter);
+      otherElems = unpackTensorElements(loc, adaptor.getOther(), rewriter,
+                                        op.getOther().getType());
 
     // If the op has a contiguity hint use it to increase the vector size.
     vec = std::max(vec, op.getContiguity());
@@ -904,9 +949,9 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto flatDstTy = dstTy;
     SmallVector<Value> swizzledLaneOffsets;
     auto maybeSwizzledEnc = dyn_cast<SwizzledSharedEncodingAttr>(dstEnc);
-    bool requiresSrcPtrSwizzling =
-        !targetInfo.supportsDirectToLDSScattering() && maybeSwizzledEnc &&
-        maybeSwizzledEnc.getMaxPhase() != 1;
+    bool requiresSrcPtrSwizzling = !targetInfo.supportsDirectToLdsScatter() &&
+                                   maybeSwizzledEnc &&
+                                   maybeSwizzledEnc.getMaxPhase() != 1;
     if (requiresSrcPtrSwizzling) {
       auto flatSharedEnc = SwizzledSharedEncodingAttr::get(
           op->getContext(), maybeSwizzledEnc.getVec(), 1, 1,
@@ -932,14 +977,15 @@ struct AsyncCopyGlobalToLocalOpConversion
     freeVarMasks[rewriter.getStringAttr("block")] = 0;
     Value threadPred = emitRedundantThreadPredicateNonNull(
         freeVarMasks, rewriter, loc, targetInfo);
+    bool hasMask = static_cast<bool>(op.getMask());
+    bool threadPredIsWarpUniform =
+        isRedundantThreadPredWarpUniform(freeVarMasks, rewriter.getContext());
 
-    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
-    auto emitGlobalLoadLds =
-        [this, &op, &b, laneId = laneId, threadPred, srcPtrTy, otherTy,
-         hasOther, requiresSrcPtrSwizzling](
-            RewriterBase &rewriter, Location loc, ArrayRef<Value> loadValues,
-            Value shmemAddr, int startIdx, VectorType vecTy,
-            Value multicastMask) -> SmallVector<Value> {
+    auto laneId = getLaneId(rewriter, loc);
+    auto emitGlobalLoadLds = [&](RewriterBase &rewriter, Location loc,
+                                 ArrayRef<Value> loadValues, Value shmemAddr,
+                                 int startIdx, VectorType vecTy,
+                                 Value multicastMask) -> SmallVector<Value> {
       auto [srcElem, maskElem, otherElems, swizzleLaneOffset] =
           unzipAsyncCopyValues(rewriter, loc, startIdx, loadValues, srcPtrTy,
                                otherTy, hasOther, vecTy.getNumElements());
@@ -954,19 +1000,20 @@ struct AsyncCopyGlobalToLocalOpConversion
       // Predicate load based on threadPred && swizzledMask
       auto cond = b.and_(threadPred, maybeSwizzledMaskElem);
 
-      if (targetInfo.supportsDirectToLDSScattering()) {
-        // On architectures supporting per lane LDS addresses we can mask by
-        // setting the shared address to out of range. The HW will drop the load
-        // before fetching the data from global memory.
-        Value outOfRangeAddress =
-            b.inttoptr(shmemAddr.getType(), b.i32_val(0x7FFFFFFF));
-        Value predicatedAddress = b.select(cond, shmemAddr, outOfRangeAddress);
+      if (targetInfo.supportsDirectToLdsScatter() ||
+          (threadPredIsWarpUniform && !hasMask)) {
+        // For architectures supporting per lane LDS addresses or if the
+        // predicate is warp-uniform, mask loads by setting the *shared* address
+        // to out of range, the HW will drop the load before fetching the data
+        // from global memory.
+        Value predicatedAddress =
+            selectLdsAddressForPredicate(b, cond, shmemAddr);
 
         emitAsyncLoad(rewriter, loc, targetInfo, vecBits, srcElem,
                       predicatedAddress, op.getCache(), multicastMask);
       } else {
         // For architectures not supporting per lane LDS addresses we need to
-        // emit a branch
+        // emit a branch.
         auto [loadBlock, afterLoadBlock] = emitBranch(rewriter, loc, cond);
 
         emitAsyncLoad(rewriter, loc, targetInfo, vecBits, srcElem, shmemAddr,
@@ -1016,9 +1063,6 @@ struct AsyncCopyGlobalToLocalOpConversion
       if (targetInfo.requiresAliasInfoForAsyncOps())
         AMD::addAsyncCopyAliasScope(asyncLoadOp);
     } else if (targetInfo.getISAFamily() == ISAFamily::GFX1250) {
-      if (cacheMod != triton::CacheModifier::NONE) {
-        emitRemark(loc) << "cache modifiers not yet implemented on gfx1250";
-      }
       switch (vecBits) {
       case 32:
         if (multicastMask)
@@ -1093,7 +1137,8 @@ struct AsyncCopyLocalToGlobalOpConversion
     auto maskElements = getMaskElemsAndUpdateVeclen(
         rewriter, loc, adaptor.getMask(), op.getMask(), vec);
 
-    auto dstElems = unpackLLElements(loc, adaptor.getDst(), rewriter);
+    auto dstElems = unpackTensorElements(loc, adaptor.getDst(), rewriter,
+                                         op.getDst().getType());
 
     // If the op has a contiguity hint use it to increase the vector size.
     vec = std::max(vec, op.getContiguity());
@@ -1154,19 +1199,36 @@ struct AsyncCopyLocalToGlobalOpConversion
                       AMD::TargetInfo targetInfo, int vecBits, Value dstPtr,
                       Value shmemAddr, triton::CacheModifier cacheMod) const {
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-    assert(targetInfo.supportsDirectFromLdsStoreBitWidth(vecBits));
     int32_t cacheModifiers =
         mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
             cacheMod, /*isLoad=*/false, targetInfo);
 
-    if (cacheMod != triton::CacheModifier::NONE) {
-      emitRemark(loc) << "cache modifiers not yet implemented on gfx1250";
+    auto emitStore = [&](int bits, Value dst, Value shmem) {
+      std::string intrinsic =
+          "llvm.amdgcn.global.store.async.from.lds.b" + std::to_string(bits);
+      LLVM::createLLVMIntrinsicCallOp(
+          rewriter, loc, intrinsic, {},
+          {dst, shmem, b.i32_val(0), b.i32_val(cacheModifiers)});
+    };
+
+    // If vecBits is not supported but vecBits/2 is, split into two
+    // stores
+    if (!targetInfo.supportsDirectFromLdsStoreBitWidth(vecBits) &&
+        targetInfo.supportsDirectFromLdsStoreBitWidth(vecBits / 2)) {
+      int halfVecBits = vecBits / 2;
+      int halfVecBytes = halfVecBits / 8;
+      // First half store
+      emitStore(halfVecBits, dstPtr, shmemAddr);
+      // Second half store (advance pointers by halfVecBytes)
+      Value dstPtr2 = b.gep(ptr_ty(rewriter.getContext(), 1), i8_ty, dstPtr,
+                            b.i32_val(halfVecBytes));
+      Value shmemAddr2 = b.gep(ptr_ty(rewriter.getContext(), 3), i8_ty,
+                               shmemAddr, b.i32_val(halfVecBytes));
+      emitStore(halfVecBits, dstPtr2, shmemAddr2);
+    } else {
+      assert(targetInfo.supportsDirectFromLdsStoreBitWidth(vecBits));
+      emitStore(vecBits, dstPtr, shmemAddr);
     }
-    std::string intrinsic =
-        "llvm.amdgcn.global.store.async.from.lds.b" + std::to_string(vecBits);
-    LLVM::createLLVMIntrinsicCallOp(
-        rewriter, loc, intrinsic, {},
-        {dstPtr, shmemAddr, b.i32_val(0), b.i32_val(cacheModifiers)});
   }
 };
 
@@ -1216,20 +1278,22 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
     }
 
     SmallVector<Value> desc =
-        unpackLLElements(loc, adaptor.getDesc(), rewriter);
+        mlir::LLVM::AMD::unpackTDMDescriptor(rewriter, loc, adaptor.getDesc());
 
     SmallVector<int64_t> blockShape = llvm::to_vector(tensorDescTy.getShape());
 
-    // 2D tensors: 12 dwords (group0: 4, group1: 8)
-    // 3D-5D tensors: 20 dwords (group0: 4, group1: 8, group2: 4, group3: 4)
-    assert((blockShape.size() <= 2 && desc.size() == 12) ||
-           (blockShape.size() > 2 && desc.size() == 20));
+    // 2D tensors: 2 vector groups (group0: <4 x i32>, group1: <8 x i32>)
+    // 3D-5D tensors: 4 vector groups (+group2, group3: <4 x i32>)
+    assert((blockShape.size() <= 2 && desc.size() == 2) ||
+           (blockShape.size() > 2 && desc.size() == 4));
 
     auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getResult(), elementType, rewriter);
     // Get all base pointers (multiple for partitioned encoding)
     SmallVector<Value> dstPtrs = llvm::to_vector(dstMemObj.getBases());
-    SmallVector<Value> offset = adaptor.getIndices();
+    // Positioning lives in the descriptor; the copy only does per-warp
+    // distribution, so the user offset is zero.
+    SmallVector<Value> offset(blockShape.size(), b.i32_val(0));
     int numWarps = triton::gpu::lookupNumWarps(op);
 
     Value barrierPtr = nullptr;
@@ -1246,15 +1310,22 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
 
     auto shapePerCTA =
         triton::gpu::getShapePerCTA(encoding, tensorDescTy.getShape());
-    auto sharedOrder = triton::gpu::getOrder(
-        cast<triton::gpu::SharedEncodingTrait>(encoding), shapePerCTA);
-    bool isRowMajor = sharedOrder[0] == (sharedOrder.size() - 1);
 
+    std::optional<uint32_t> warpUsedHint;
+    if (auto hintAttr = op.getWarpUsedHintAttr())
+      warpUsedHint = static_cast<uint32_t>(hintAttr.getInt());
+
+    auto cacheMod = op.getCache();
+    auto auxBits = mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
+        cacheMod, /*isLoad*/ true, targetInfo);
+
+    // Placeholder: the copy inherits pred from the descriptor.
+    Value pred = b.i32_val(1);
     mlir::LLVM::AMD::emitTDMLoadStore(
         rewriter, loc, getTypeConverter(), desc, shapePerCTA, numWarps,
-        padInterval, padAmount, offset, dstPtrs, op.getPred(), multicastMask,
+        padInterval, padAmount, offset, dstPtrs, pred, multicastMask,
         elementType, barrierPtr, /*isLoad=*/true, sharedLayout, encoding, ctaId,
-        isRowMajor);
+        auxBits, warpUsedHint, /*isPureForm=*/true);
 
     rewriter.eraseOp(op);
     return success();
@@ -1283,20 +1354,22 @@ struct AsyncTDMCopyLocalToGlobalOpConversion
     Type elementType = getTypeConverter()->convertType(smemTy.getElementType());
 
     SmallVector<Value> desc =
-        unpackLLElements(loc, adaptor.getDesc(), rewriter);
+        mlir::LLVM::AMD::unpackTDMDescriptor(rewriter, loc, adaptor.getDesc());
 
     SmallVector<int64_t> blockShape = llvm::to_vector(tensorDescTy.getShape());
 
-    // 2D tensors: 12 dwords (group0: 4, group1: 8)
-    // 3D-5D tensors: 20 dwords (group0: 4, group1: 8, group2: 4, group3: 4)
-    assert((blockShape.size() <= 2 && desc.size() == 12) ||
-           (blockShape.size() > 2 && desc.size() == 20));
+    // 2D tensors: 2 vector groups (group0: <4 x i32>, group1: <8 x i32>)
+    // 3D-5D tensors: 4 vector groups (+group2, group3: <4 x i32>)
+    assert((blockShape.size() <= 2 && desc.size() == 2) ||
+           (blockShape.size() > 2 && desc.size() == 4));
 
     auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getSrc(), elementType, rewriter);
     // Get all base pointers (multiple for partitioned encoding)
     SmallVector<Value> srcPtrs = llvm::to_vector(dstMemObj.getBases());
-    SmallVector<Value> offset = adaptor.getIndices();
+    // Positioning lives in the descriptor; the copy only does per-warp
+    // distribution, so the user offset is zero.
+    SmallVector<Value> offset(blockShape.size(), b.i32_val(0));
     int numWarps = triton::gpu::lookupNumWarps(op);
 
     Value barrierPtr = nullptr;
@@ -1326,17 +1399,19 @@ struct AsyncTDMCopyLocalToGlobalOpConversion
     auto ctaId = targetInfo.getClusterCTAId(rewriter, loc);
 
     auto shapePerCTA = triton::gpu::getShapePerCTA(smemTy);
-    auto sharedOrder = triton::gpu::getOrder(
-        cast<triton::gpu::SharedEncodingTrait>(smemTy.getEncoding()),
-        shapePerCTA);
-    bool isRowMajor = sharedOrder[0] == (sharedOrder.size() - 1);
 
+    auto cacheMod = op.getCache();
+    auto auxBits = mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
+        cacheMod, /*isLoad*/ false, targetInfo);
+
+    // Placeholder: the copy inherits pred from the descriptor.
     Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
     mlir::LLVM::AMD::emitTDMLoadStore(
         rewriter, loc, getTypeConverter(), desc, shapePerCTA, numWarps,
         padInterval, padAmount, offset, srcPtrs, pred,
         /*multicastMask=*/{}, elementType, barrierPtr,
-        /*isLoad=*/false, sharedLayout, encoding, ctaId, isRowMajor);
+        /*isLoad=*/false, sharedLayout, encoding, ctaId, auxBits,
+        /*warpUsedHint=*/std::nullopt, /*isPureForm=*/true);
 
     rewriter.eraseOp(op);
     return success();
@@ -1369,7 +1444,7 @@ struct AsyncTDMScatterOpConversion
     Type elementType = getTypeConverter()->convertType(smemTy.getElementType());
 
     SmallVector<Value> desc =
-        unpackLLElements(loc, adaptor.getDesc(), rewriter);
+        mlir::LLVM::AMD::unpackTDMDescriptor(rewriter, loc, adaptor.getDesc());
 
     SmallVector<int64_t> blockShape = llvm::to_vector(tensorDescTy.getShape());
 
@@ -1393,31 +1468,45 @@ struct AsyncTDMScatterOpConversion
 
     // Get the destination row indices for scatter
     SmallVector<Value> dstRowIndices =
-        unpackLLElements(loc, adaptor.getDstRowIndices(), rewriter);
+        unpackTensorElements(loc, adaptor.getDstRowIndices(), rewriter,
+                             op.getDstRowIndices().getType());
 
     auto shapePerCTA = triton::gpu::getShapePerCTA(smemTy);
-
-    // Get the destination column offset
-    Value dstColOffset = adaptor.getDstColOffset();
 
     auto dstRowIndicesType =
         cast<RankedTensorType>(op.getDstRowIndices().getType());
 
+    // Extract padding information if present
+    auto paddedEnc =
+        llvm::dyn_cast<PaddedSharedEncodingAttr>(smemTy.getEncoding());
+    unsigned padInterval = 0;
+    unsigned padAmount = 0;
+    if (paddedEnc) {
+      assert(paddedEnc.getIntervals().size() == 1 &&
+             paddedEnc.getPaddings().size() == 1);
+      padInterval = paddedEnc.getIntervals()[0];
+      padAmount = paddedEnc.getPaddings()[0];
+    }
+
     // Create the CGA layout
-    auto sharedLayout = triton::gpu::toLinearLayout(smemTy);
+    triton::LinearLayout sharedLayout;
+    if (paddedEnc) {
+      sharedLayout = paddedEnc.getLinearComponent();
+    } else {
+      sharedLayout = triton::gpu::toLinearLayout(smemTy);
+    }
     auto kBlock = rewriter.getStringAttr("block");
     auto cgaLayout = sharedLayout.sublayout(
         {kBlock}, to_vector(sharedLayout.getOutDimNames()));
     auto ctaId = targetInfo.getClusterCTAId(rewriter, loc);
     int numWarps = triton::gpu::lookupNumWarps(op);
 
-    // Predicate must be i32 (not i1) to match other elements in group0
-    Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
-    mlir::LLVM::AMD::emitTDMGatherScatter(
-        rewriter, loc, getTypeConverter(), desc, shapePerCTA,
-        /*padInterval=*/0, /*padAmount=*/0, srcPtr, pred, elementType,
-        barrierPtr, cgaLayout, ctaId, dstRowIndices, dstColOffset,
-        /*isGather=*/false, numWarps, dstRowIndicesType);
+    if (failed(mlir::LLVM::AMD::emitTDMGatherScatter(
+            rewriter, loc, getTypeConverter(), desc, shapePerCTA, padInterval,
+            padAmount, srcPtr, /*multicastMask=*/{}, elementType, barrierPtr,
+            cgaLayout, ctaId, dstRowIndices,
+            /*isGather=*/false, numWarps, dstRowIndicesType)))
+      return failure();
 
     rewriter.eraseOp(op);
     return success();
@@ -1440,11 +1529,6 @@ struct AsyncTDMGatherOpConversion
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
-    // Multi-CTA not supported for gather
-    if (lookupNumCTAs(op) > 1) {
-      return op.emitError("TDM gather does not support multi-CTA");
-    }
-
     auto tensorDescTy = op.getDesc().getType();
     auto smemTy = op.getDst().getType();
     auto paddedEnc =
@@ -1452,7 +1536,7 @@ struct AsyncTDMGatherOpConversion
     Type elementType = getTypeConverter()->convertType(smemTy.getElementType());
 
     SmallVector<Value> desc =
-        unpackLLElements(loc, adaptor.getDesc(), rewriter);
+        mlir::LLVM::AMD::unpackTDMDescriptor(rewriter, loc, adaptor.getDesc());
 
     SmallVector<int64_t> blockShape = llvm::to_vector(tensorDescTy.getShape());
 
@@ -1476,12 +1560,10 @@ struct AsyncTDMGatherOpConversion
 
     // Get the source row indices for gather
     SmallVector<Value> srcRowIndices =
-        unpackLLElements(loc, adaptor.getSrcRowIndices(), rewriter);
+        unpackTensorElements(loc, adaptor.getSrcRowIndices(), rewriter,
+                             op.getSrcRowIndices().getType());
 
     auto shapePerCTA = triton::gpu::getShapePerCTA(smemTy);
-
-    // Get the source column offset
-    Value srcColOffset = adaptor.getSrcColOffset();
 
     auto srcRowIndicesType =
         cast<RankedTensorType>(op.getSrcRowIndices().getType());
@@ -1506,11 +1588,20 @@ struct AsyncTDMGatherOpConversion
     auto ctaId = targetInfo.getClusterCTAId(rewriter, loc);
     int numWarps = triton::gpu::lookupNumWarps(op);
 
-    mlir::LLVM::AMD::emitTDMGatherScatter(
-        rewriter, loc, getTypeConverter(), desc, shapePerCTA, padInterval,
-        padAmount, dstPtr, op.getPred(), elementType, barrierPtr, cgaLayout,
-        ctaId, srcRowIndices, srcColOffset,
-        /*isGather=*/true, numWarps, srcRowIndicesType);
+    Value multicastMask;
+    if (targetInfo.supportsMultiCTALaunch()) {
+      // Use the sharedLayout to compute the multicast mask because the index
+      // layout only describes rows and misses information about columns.
+      multicastMask =
+          LLVM::AMD::emitCtaMulticastMask(rewriter, loc, ctaId, sharedLayout);
+    }
+
+    if (failed(mlir::LLVM::AMD::emitTDMGatherScatter(
+            rewriter, loc, getTypeConverter(), desc, shapePerCTA, padInterval,
+            padAmount, dstPtr, multicastMask, elementType, barrierPtr,
+            cgaLayout, ctaId, srcRowIndices,
+            /*isGather=*/true, numWarps, srcRowIndicesType)))
+      return failure();
 
     rewriter.eraseOp(op);
     return success();
@@ -1549,8 +1640,9 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     unsigned vec = getVectorSize(ptr, axisAnalysisPass);
     unsigned elemsPerThread = getTotalElemsPerThread(ptr.getType());
 
-    auto ptrElems = unpackLLElements(loc, llPtr, rewriter);
-    auto valueElems = unpackLLElements(loc, llValue, rewriter);
+    auto ptrElems = unpackTensorElements(loc, llPtr, rewriter, ptr.getType());
+    auto valueElems =
+        unpackTensorElements(loc, llValue, rewriter, op.getValue().getType());
     assert(ptrElems.size() == valueElems.size());
 
     SmallVector<Value> maskElems =
@@ -1651,8 +1743,10 @@ struct BufferAtomicRMWOpConversion
     }
 
     // Get the offsets and value
-    SmallVector<Value> offsetElems = unpackLLElements(loc, llOffset, rewriter);
-    SmallVector<Value> valueElems = unpackLLElements(loc, llData, rewriter);
+    SmallVector<Value> offsetElems = unpackTensorElements(
+        loc, llOffset, rewriter, op.getOffsets().getType());
+    SmallVector<Value> valueElems =
+        unpackTensorElements(loc, llData, rewriter, data.getType());
 
     // Get the mask
     SmallVector<Value> maskElems =
@@ -1770,9 +1864,12 @@ struct BufferAtomicCASOpConversion
     unsigned vec = 1u;
 
     // Get the offsets, val, and cmp
-    SmallVector<Value> offsetElems = unpackLLElements(loc, llOffset, rewriter);
-    SmallVector<Value> valElems = unpackLLElements(loc, llVal, rewriter);
-    SmallVector<Value> cmpElems = unpackLLElements(loc, llCmp, rewriter);
+    SmallVector<Value> offsetElems = unpackTensorElements(
+        loc, llOffset, rewriter, op.getOffsets().getType());
+    SmallVector<Value> valElems =
+        unpackTensorElements(loc, llVal, rewriter, op.getVal().getType());
+    SmallVector<Value> cmpElems =
+        unpackTensorElements(loc, llCmp, rewriter, op.getCmp().getType());
 
     Value rsrcDesc = bufferEmitter.createResourceDescriptor(llPtr, llStride);
     SmallVector<Value> loadedVals;
@@ -1788,7 +1885,6 @@ struct BufferAtomicCASOpConversion
     }
 
     mlir::Operation *lastCASOp;
-    MLIRContext *ctx = rewriter.getContext();
     GCNBuilder waitcntBuilder;
 
     // Check if the op has users, if it does we set GLC=1, otherwise GLC=0
@@ -1878,8 +1974,10 @@ struct BufferStoreOpConversion
     vec = std::max(vec, op.getContiguity());
 
     // Get the offsets and value
-    SmallVector<Value> offsetElems = unpackLLElements(loc, llOffset, rewriter);
-    SmallVector<Value> valueElems = unpackLLElements(loc, llData, rewriter);
+    SmallVector<Value> offsetElems = unpackTensorElements(
+        loc, llOffset, rewriter, op.getOffsets().getType());
+    SmallVector<Value> valueElems =
+        unpackTensorElements(loc, llData, rewriter, data.getType());
 
     // Get the mask
     SmallVector<Value> maskElems =
@@ -1937,9 +2035,12 @@ struct AtomicCASOpConversion
     Value llVal = adaptor.getVal();
 
     // prep data by unpacking to get data ready
-    auto ptrElements = unpackLLElements(loc, llPtr, rewriter);
-    auto cmpElements = unpackLLElements(loc, llCmp, rewriter);
-    auto valElements = unpackLLElements(loc, llVal, rewriter);
+    auto ptrElements =
+        unpackTensorElements(loc, llPtr, rewriter, op.getPtr().getType());
+    auto cmpElements =
+        unpackTensorElements(loc, llCmp, rewriter, op.getCmp().getType());
+    auto valElements =
+        unpackTensorElements(loc, llVal, rewriter, op.getVal().getType());
 
     auto memOrdering = op.getSem();
     auto atomicMemOrdering = getMemoryOrdering(memOrdering);
@@ -2130,11 +2231,14 @@ struct AtomicRMWOpConversion
     Value llVal = adaptor.getVal();
     Value llMask = adaptor.getMask();
 
-    auto valElements = unpackLLElements(loc, llVal, rewriter);
-    auto ptrElements = unpackLLElements(loc, llPtr, rewriter);
+    auto valElements =
+        unpackTensorElements(loc, llVal, rewriter, op.getVal().getType());
+    auto ptrElements =
+        unpackTensorElements(loc, llPtr, rewriter, op.getPtr().getType());
     SmallVector<Value> maskElements;
     if (llMask)
-      maskElements = unpackLLElements(loc, llMask, rewriter);
+      maskElements =
+          unpackTensorElements(loc, llMask, rewriter, op.getMask().getType());
 
     auto tensorTy = dyn_cast<RankedTensorType>(opResult.getType());
     Type valueElemTy =
@@ -2472,7 +2576,7 @@ struct TDMPrefetchConversion
     Type elementType =
         getTypeConverter()->convertType(tdescType.getElementType());
     SmallVector<Value> desc =
-        unpackLLElements(loc, adaptor.getDesc(), rewriter);
+        mlir::LLVM::AMD::unpackTDMDescriptor(rewriter, loc, adaptor.getDesc());
     SmallVector<Value> offset = adaptor.getIndices();
 
     auto mod = op->getParentOfType<ModuleOp>();
@@ -2495,11 +2599,8 @@ struct TDMPrefetchConversion
     }
 
     // Return offsets
-    Type llvmResultStructTy = getTypeConverter()->convertType(op.getType(0));
-    auto structType = dyn_cast<LLVM::LLVMStructType>(
-        getTypeConverter()->convertType(op.getType(0)));
-    Value resultStruct = packLLElements(loc, getTypeConverter(), offsets,
-                                        rewriter, llvmResultStructTy);
+    Value resultStruct = packTensorElements(loc, getTypeConverter(), offsets,
+                                            rewriter, op.getType(0));
     rewriter.replaceOp(op, {resultStruct});
     return success();
   }

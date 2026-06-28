@@ -1,6 +1,5 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TritonAMDGPUToLLVM/PatternTritonAMDGPUToLLVM.h"
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "third_party/amd/lib/TritonAMDGPUToLLVM/Utility.h"
@@ -31,8 +30,10 @@ struct ScaledUpcastFp4OpPattern
     auto loc = upcastOp.getLoc();
     auto elemType = upcastOp.getType().getElementType();
 
-    auto inputVals = unpackLLElements(loc, adaptor.getInput(), rewriter);
-    auto scaleVals = unpackLLElements(loc, adaptor.getScale(), rewriter);
+    auto inputVals =
+        unpackUniqueTensorElements(loc, adaptor.getInput(), rewriter);
+    auto scaleVals =
+        unpackUniqueTensorElements(loc, adaptor.getScale(), rewriter);
 
     assert(inputVals.size() % 4 == 0);
     SmallVector<Value> results;
@@ -110,8 +111,8 @@ struct ScaledUpcastFp4OpPattern
       }
     }
 
-    Value result = packLLElements(loc, getTypeConverter(), results, rewriter,
-                                  upcastOp.getType());
+    Value result = packUniqueTensorElements(loc, getTypeConverter(), results,
+                                            rewriter, upcastOp.getType());
     rewriter.replaceOp(upcastOp, result);
     return success();
   }
@@ -134,8 +135,10 @@ struct ScaledUpcastFp8OpPattern
     auto elemType = upcastOp.getType().getElementType();
     auto fp8ElemType = upcastOp.getInput().getType().getElementType();
 
-    auto inputVals = unpackLLElements(loc, adaptor.getInput(), rewriter);
-    auto scaleVals = unpackLLElements(loc, adaptor.getScale(), rewriter);
+    auto inputVals =
+        unpackUniqueTensorElements(loc, adaptor.getInput(), rewriter);
+    auto scaleVals =
+        unpackUniqueTensorElements(loc, adaptor.getScale(), rewriter);
 
     assert(inputVals.size() % 4 == 0);
     assert(inputVals.size() == scaleVals.size());
@@ -211,8 +214,8 @@ struct ScaledUpcastFp8OpPattern
       }
     }
 
-    Value result = packLLElements(loc, getTypeConverter(), results, rewriter,
-                                  upcastOp.getType());
+    Value result = packUniqueTensorElements(loc, getTypeConverter(), results,
+                                            rewriter, upcastOp.getType());
     rewriter.replaceOp(upcastOp, result);
     return success();
   }

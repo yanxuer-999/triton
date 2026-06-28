@@ -87,7 +87,13 @@ def downcast_to_mxfp(x: torch.Tensor, out_dtype: torch.dtype, axis: int,
     # TODO: return tensor object instead of its storage
     return y_value.storage.data, y_scale.storage.data
 
-def upcast_from_mxfp(tensor: torch.Tensor, scale: torch.Tensor, target_dtype: torch.dtype, axis: int):
+def upcast_from_mxfp(
+    tensor: torch.Tensor,
+    scale: torch.Tensor,
+    target_dtype: torch.dtype,
+    axis: int,
+    tensor_scale: torch.Tensor | None = None,
+):
     """
     Upcasts an mxfp (packed) weight tensor back to float16 or bfloat16.
 
@@ -100,6 +106,10 @@ def upcast_from_mxfp(tensor: torch.Tensor, scale: torch.Tensor, target_dtype: to
     axis = axis if axis >= 0 else axis + ndim
     assert tensor.ndim == scale.ndim, (f"Weight and scale must have the same number of dimensions. "
                                        f"Got {tensor.ndim=} and {scale.ndim=}")
+    if tensor_scale is not None and tensor_scale.numel() != 1:
+        expected_tensor_scale_shape = tensor.shape[:axis] + tensor.shape[axis + 1:]
+        assert tensor_scale.shape == expected_tensor_scale_shape, \
+            f"Invalid tensor scale shape: expected {expected_tensor_scale_shape}, got {tensor_scale.shape}"
     # dtype checks
     assert tensor.dtype in {torch.uint8, torch.float8_e5m2, torch.float8_e4m3fn}, \
         f"Invalid tensor dtype {tensor.dtype=}"
@@ -160,6 +170,9 @@ def upcast_from_mxfp(tensor: torch.Tensor, scale: torch.Tensor, target_dtype: to
     else:
         out = torch.empty(original_out_shape, dtype=target_dtype, device=tensor.device)
     out = out.transpose(axis, scale.ndim - 1).contiguous()
+    if tensor_scale is not None:
+        tensor_scale_shape = (1,) * out.ndim if tensor_scale.numel() == 1 else (*tensor_scale.shape[:axis], 1, *tensor_scale.shape[axis:])
+        out = out * tensor_scale.to(device=out.device).reshape(tensor_scale_shape)
     return out
 
 
@@ -180,6 +193,7 @@ def get_max_quant_val(dtype: torch.dtype):
 def downcast_to_mxfp_torch(src_tensor: torch.Tensor, out_quant_type: torch.dtype, axis: int,
                            scale_dtype: torch.dtype = torch.uint8,
                            microblock_size: int = MXFP_BLOCK_SIZE.value,
+                           expected_scale: torch.Tensor | None = None,
                            DEQUANT_SCALE_ROUNDING_MODE: DequantScaleRoundingMode = DequantScaleRoundingMode.ROUND_UP):
     """
     Converts the src tensor to the output format specified by out_quant_type.
@@ -191,6 +205,9 @@ def downcast_to_mxfp_torch(src_tensor: torch.Tensor, out_quant_type: torch.dtype
          • For mxfp8, the output has the same shape as src_tensor.
          • For FP4, the size along the axis is halved, and the tensor is returned as a torch.uint8.
       scale: Scale tensor computed per microblock along the axis.
+
+    If expected_scale is provided, apply the same preconditioning as float_to_flex
+    before microscaled output quantization by dividing the source tensor by it.
     """
     # This should probably be packed into its own tiny class
     ndim = src_tensor.ndim
@@ -217,6 +234,12 @@ def downcast_to_mxfp_torch(src_tensor: torch.Tensor, out_quant_type: torch.dtype
 
     # Permute the tensor so that the contiguous axis becomes the last dimension.
     src = src_tensor.transpose(axis, src_tensor.ndim - 1).to(torch.float32)
+    if expected_scale is not None:
+        if expected_scale.numel() == 1:
+            src = src / expected_scale.to(device=device, dtype=src.dtype)
+        else:
+            assert src.ndim == 3
+            src = src / expected_scale.to(device=device, dtype=src.dtype)[:, None, None]
     axis_shape = src.shape[-1]
 
     # Pad the axis to be divisible by the microblock size, in case it is not.
@@ -251,6 +274,9 @@ def downcast_to_mxfp_torch(src_tensor: torch.Tensor, out_quant_type: torch.dtype
             ds_int_rounded = ds_int & 0x7F800000
         dequant_scale_rounded = ds_int_rounded.view(torch.float32)
     else:
+        # Direct fp8 scales keep the existing plain cast semantics here: the
+        # stored scale is rounded by the fp8 conversion rather than forced
+        # upward despite the ROUND_UP mode name.
         dequant_scale_rounded = dequant_scale.to(scale_dtype).to(torch.float32)
 
     # Compute the quantization scale.
@@ -363,6 +389,8 @@ def upcast_from_mxfp_torch(tensor: torch.Tensor, scale: torch.Tensor, target_dty
         fp32_tensor = tensor.to(torch.float32)
 
     logical_quant_dim = tensor.shape[-1] * (2 if tensor.dtype == torch.uint8 else 1)
+    if logical_quant_dim == 0:
+        return fp32_tensor.to(target_dtype).transpose(axis, tensor.ndim - 1).contiguous()
     if scale.dtype == torch.uint8:
         dq_scale = (scale.to(torch.int32) << 23).view(torch.float32)
         scale_block_size = MXFP_BLOCK_SIZE.value

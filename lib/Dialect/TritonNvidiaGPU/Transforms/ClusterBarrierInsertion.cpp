@@ -31,8 +31,8 @@ static bool isDistributedMultiCTAOp(Operation *op, bool isRead) {
     auto srcTy = cvt.getSrc().getType();
     auto dstTy = cvt.getType();
     auto kBlock = StringAttr::get(op->getContext(), "block");
-    auto conversion = minimalCvtLayout(srcTy, dstTy);
-    return conversion.hasInDim(kBlock);
+    return !isCvtDimSync(ttg::toLinearLayout(srcTy), ttg::toLinearLayout(dstTy),
+                         kBlock);
   }
   if (auto reduce = dyn_cast<triton::ReduceOp>(op)) {
     if (!isRead)
@@ -46,6 +46,8 @@ static bool isDistributedMultiCTAOp(Operation *op, bool isRead) {
   } else if (isa<ttng::TMEMCopyOp>(op)) {
     return ttng::getModuleTwoCTAs(op);
   } else if (auto tma = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
+    return tma.getMulticast();
+  } else if (auto tma = dyn_cast<ttng::AsyncTMAGatherOp>(op)) {
     return tma.getMulticast();
   }
   return false;
@@ -106,8 +108,11 @@ usesTrackedBarrierInCrossCTAConsumerOp(Operation *op,
   if (auto commit = dyn_cast<ttng::TCGen5CommitOp>(op)) {
     return ttng::getModuleTwoCTAs(op) && aliasesTracked(commit.getBarrier());
   }
-  if (auto tma = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
+  if (auto tma = dyn_cast<ttng::TMALoadLikeOpInterface>(op)) {
     return tma.getMulticast() && aliasesTracked(tma.getBarrier());
+  }
+  if (auto clc = dyn_cast<ttng::CLCTryCancelOp>(op)) {
+    return aliasesTracked(clc.getMbarrier());
   }
   return false;
 }

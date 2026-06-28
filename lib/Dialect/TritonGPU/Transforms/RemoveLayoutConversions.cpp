@@ -113,13 +113,14 @@ private:
 class LayoutRematerialization {
 public:
   LayoutRematerialization(FuncOp F) : funcOp(F) {}
+  ~LayoutRematerialization();
 
   // Map the original value to the remat'ed one.
   void addRematValue(Value old, Attribute encoding, Value newV);
   // Get the remat'ed value in the given encoding, if one already exists and
   // is different then the layout conversion root.
   Value getRematValue(Value value, Attribute encoding) const {
-    return rematMapping.lookup({value, encoding});
+    return rematMapping.lookup(value).lookup(encoding);
   }
 
   bool backwardRematerialization();
@@ -177,22 +178,39 @@ public:
 
 private:
   void updateRematMapping(SmallVector<std::tuple<Value, Value>> &values);
-  // Existing tuples of (value, layout) that needs to be updated when recreating
-  // scf ops. This prevents keeping track of Values that have been delete when
-  // rewriting slices.
-  DenseMap<Value, Attribute> mappedValues;
-  // map of the values remat based on encoding.
-  DenseMap<std::pair<Value, Attribute>, Value> rematMapping;
+  // Map values to their rematerializations for a given encoding. We have to be
+  // careful about what we put in this map because updateRematMapping only
+  // updates keys, and doesn't search for rematerialized values that may be
+  // replaced. This means it is only safe to add something to the map as a value
+  // if it is either guaranteed to outlive the map, or if it is mapped to some
+  // key that we know will always be replaced at the same time (e.g. different
+  // block args or results of an scf op).
+  DenseMap<Value, DenseMap<Attribute, Value>> rematMapping;
   FuncOp funcOp;
   DominanceInfo domInfo;
   PostDominanceInfo postDomInfo;
 };
 
+LayoutRematerialization::~LayoutRematerialization() {
+#ifndef NDEBUG
+  DenseSet<Value> live;
+  funcOp.walk([&](Block *block) {
+    live.insert(block->args_begin(), block->args_end());
+    for (Operation &op : *block)
+      live.insert(op.result_begin(), op.result_end());
+  });
+  for (const auto &[key, remats] : rematMapping) {
+    assert(live.contains(key) && "remat mapping: key not present");
+    for (const auto &[encoding, remat] : remats)
+      assert(live.contains(remat) && "remat mapping: value not present");
+  }
+#endif
+}
+
 void LayoutRematerialization::addRematValue(Value old, Attribute encoding,
                                             Value newV) {
   LDBG("addRematValue " << old << " encoding " << encoding << " " << newV);
-  rematMapping[{old, encoding}] = newV;
-  mappedValues[old] = encoding;
+  rematMapping[old][encoding] = newV;
 }
 
 // Return true if the op is an op with a layout we don't want to change. We will
@@ -202,8 +220,8 @@ bool isLayoutAnchor(Operation *op) {
     return true;
   if (isa<LoadOp, StoreOp>(op))
     return isExpensiveLoadOrStore(op);
-  if (isa<DotOp, DotScaledOp, nvidia_gpu::WarpGroupDotOp, AtomicRMWOp,
-          AtomicCASOp, triton::nvidia_gpu::TMEMLoadOp>(op))
+  if (isa<DotOpInterface, AtomicRMWOp, AtomicCASOp,
+          triton::nvidia_gpu::TMEMLoadOp>(op))
     return true;
   if (auto gatherOp = dyn_cast<GatherOp>(op))
     return gatherOp.getEfficientLayout();
@@ -653,10 +671,12 @@ void LayoutPropagation::rewriteOp(Operation *op) {
 bool canBeRemat(Operation *op) {
   if (isa<LoadOp, StoreOp>(op))
     return !isExpensiveLoadOrStore(op);
-  if (isa<AtomicRMWOp, AtomicCASOp, DotOp>(op))
+  if (isa<AtomicRMWOp, AtomicCASOp, DotOpInterface>(op))
     return false;
   if (auto gather = dyn_cast<GatherOp>(op))
     return !gather.getEfficientLayout();
+  if (auto reshape = dyn_cast<ReshapeOp>(op))
+    return !reshape.getEfficientLayout();
 
   if (isa<scf::WhileOp, scf::ConditionOp>(op))
     return false;
@@ -667,14 +687,13 @@ bool canBeRemat(Operation *op) {
 void LayoutRematerialization::updateRematMapping(
     SmallVector<std::tuple<Value, Value>> &values) {
   for (auto [old, newV] : values) {
-    auto it = mappedValues.find(old);
-    if (it != mappedValues.end()) {
-      Attribute encoding = it->second;
-      auto rematIt = rematMapping.find({old, it->second});
-      assert(rematIt != rematMapping.end());
-      Value replacedValue = rematIt->second;
-      rematMapping.erase(rematIt);
-      mappedValues.erase(it);
+    auto it = rematMapping.find(old);
+    if (it == rematMapping.end())
+      continue;
+    auto remats = std::move(it->second);
+    rematMapping.erase(it);
+    auto &newRemats = rematMapping[newV];
+    for (auto [encoding, replacedValue] : remats) {
       // Loop through the replacement value to find the new version of remat
       // value. This should be okay as the number of values should be small.
       for (auto [before, after] : values) {
@@ -683,8 +702,7 @@ void LayoutRematerialization::updateRematMapping(
           break;
         }
       }
-      rematMapping[{newV, encoding}] = replacedValue;
-      mappedValues[newV] = encoding;
+      newRemats[encoding] = replacedValue;
     }
   }
 }
@@ -844,8 +862,10 @@ void LayoutRematerialization::rewriteSlice(
       addRematValue(old, it->second, newV);
     }
   }
-  // Check mapping and see if there are existing convertOps on the old Argument
-  convertOp.replaceAllUsesWith(mapping.lookup(convertOp.getSrc()));
+  // Add the rewritten convert to the replacements so it is removed from the
+  // remat maps and has its uses replaced like the other ops we delete.
+  replacements.emplace_back(convertOp.getResult(),
+                            mapping.lookup(convertOp.getSrc()));
 
   updateRematMapping(replacements);
   for (auto &kv : replacements) {
@@ -1015,8 +1035,14 @@ static int64_t getByteCount(Value result, int64_t minElementCount = 0,
   return (elementCount * dtypeBitWidth) >> 3;
 }
 
-/// Compute the cost of a ConvertLayoutOp with source \p convertSrc.
-int64_t getConvertCost(Value convertSrc) {
+/// Compute the cost of a ConvertLayoutOp with source \p convertSrc and result
+/// encoding \p resultEncoding.
+int64_t getConvertCost(Value convertSrc, Attribute resultEncoding) {
+  auto srcType = cast<RankedTensorType>(convertSrc.getType());
+  auto resultType = srcType.cloneWithEncoding(resultEncoding);
+  if (cvtReordersRegisters(srcType, resultType))
+    return 0;
+
   // Measure the number of bytes that we're manipulating with the
   // ConvertLayoutOp. We pessimistically assume that we round-trip
   // through shared memory and that we cannot vectorise sub-register
@@ -1030,10 +1056,19 @@ int64_t getConvertCost(Value convertSrc) {
   return 32 * convertLayoutBytes;
 }
 
+static unsigned getCostFactor(Value result, Attribute rematEncoding) {
+  auto tensorType = cast<RankedTensorType>(result.getType());
+  unsigned oldElemsPerThread = getUniqueElemsPerThread(tensorType);
+  unsigned newElemsPerThread =
+      getUniqueElemsPerThread(rematEncoding, tensorType.getShape());
+  return std::max(1u, newElemsPerThread / oldElemsPerThread);
+}
+
 /// Determine whether rematerializing \p slice is beneficial given that it will
 /// eliminate \p convertOp and require creating new convert ops with cost \p
 /// newCvtCost.
 bool isRematBeneficial(ConvertLayoutOp convertOp, const SetVector<Value> &slice,
+                       const DenseMap<Value, Attribute> &layout,
                        int64_t newCvtCost) {
   // Identify all operations in the slice
   SetVector<Operation *> sliceOps;
@@ -1054,6 +1089,24 @@ bool isRematBeneficial(ConvertLayoutOp convertOp, const SetVector<Value> &slice,
       auto *user = use.getOwner();
       if (user == convertOp || sliceOps.contains(user))
         continue;
+      // For region branch ops, check whether the values they flow into are in
+      // the slice or unused instead.
+      if (isa<RegionBranchTerminatorOpInterface>(user))
+        user = user->getParentOp();
+      if (auto rbi = dyn_cast<RegionBranchOpInterface>(user)) {
+        RegionBranchSuccessorMapping mapping;
+        rbi.getSuccessorOperandInputMapping(mapping);
+        auto it = mapping.find(&use);
+        if (it != mapping.end()) {
+          // We have found the values this use flows into, check if they are
+          // used outside the slice.
+          bool isSliceOnly = llvm::all_of(it->second, [&](Value v) {
+            return slice.contains(v) || v.use_empty();
+          });
+          if (isSliceOnly)
+            continue;
+        }
+      }
       nonSliceOnlyValues.insert(v);
       break;
     }
@@ -1062,37 +1115,42 @@ bool isRematBeneficial(ConvertLayoutOp convertOp, const SetVector<Value> &slice,
   // Expand the set to all transitive operands in the slice.
   for (size_t i = 0; i < nonSliceOnlyValues.size(); ++i) {
     Value v = nonSliceOnlyValues[i];
-    if (auto *op = v.getDefiningOp()) {
-      for (auto operand : op->getOperands())
-        if (slice.contains(operand))
-          nonSliceOnlyValues.insert(operand);
+    auto *op = v.getDefiningOp();
+    // If the operand is a block argument, get the enclosing op.
+    op = op ? op : v.getParentBlock()->getParentOp();
+    if (auto rbi = dyn_cast<RegionBranchOpInterface>(op)) {
+      // Try to determine the operands that flow into this value, and mark them
+      // as being used outside the slice.
+      RegionBranchInverseSuccessorMapping mapping;
+      rbi.getSuccessorInputOperandMapping(mapping);
+      auto it = mapping.find(v);
+      if (it != mapping.end()) {
+        for (auto tiedOperand : it->second)
+          if (slice.contains(tiedOperand->get()))
+            nonSliceOnlyValues.insert(tiedOperand->get());
+        continue;
+      }
     }
-    // TODO: Handle block arguments.
+    // In the general case, propagate to all operands of the op.
+    for (auto operand : op->getOperands())
+      if (slice.contains(operand))
+        nonSliceOnlyValues.insert(operand);
   }
 
-  int64_t convertLayoutCost = getConvertCost(convertOp.getSrc());
+  int64_t convertLayoutCost =
+      getConvertCost(convertOp.getSrc(), convertOp.getType().getEncoding());
   int64_t rematerialisationCost = newCvtCost;
 
   // Evaluate single-use status for every operation in slice
   for (Operation *op : sliceOps) {
     auto dialect = op->getDialect();
-    // If all of the results of the op are only used within the slice, when we
-    // rematerialise, this operation does not get duplicated so it does not
-    // contribute to our cost model.
     bool isOpUsedOutsideSlice = llvm::any_of(op->getResults(), [&](Value v) {
       return nonSliceOnlyValues.contains(v);
     });
-    if (!isOpUsedOutsideSlice)
-      continue;
 
     if (isa<arith::ConstantOp>(op)) {
       // special-case: arith.constant has zero cost
       continue;
-    } else if (isa<LoadOp>(op) || isa<LocalLoadOp>(op)) {
-      // optimistically assume L1-cached:
-      for (Value result : op->getResults()) {
-        rematerialisationCost += 8 * getByteCount(result);
-      }
     } else if (isa<arith::ArithDialect, math::MathDialect>(dialect)) {
       // this is an arithmetic operation; we distinguish between cheap
       // operations (such as floating point add/mul which can be fused
@@ -1101,7 +1159,28 @@ bool isRematBeneficial(ConvertLayoutOp convertOp, const SetVector<Value> &slice,
       // multiple instructions.
       int64_t multiplier = isExpensiveMathOp(op) ? 8 : 1;
       for (Value result : op->getResults()) {
-        rematerialisationCost += multiplier * getByteCount(result);
+        Attribute rematEncoding = layout.lookup(result);
+        int64_t cost = multiplier * getByteCount(result);
+        // If the new layout increases the amount of work that needs to happen
+        // on each thread, account for that.
+        unsigned factor = getCostFactor(result, rematEncoding);
+        if (!isOpUsedOutsideSlice)
+          factor -= 1;
+        rematerialisationCost += cost * factor;
+      }
+      continue;
+    }
+
+    // If all of the results of the op are only used within the slice, when we
+    // rematerialise, this operation does not get duplicated so it does not
+    // contribute to our cost model.
+    if (!isOpUsedOutsideSlice)
+      continue;
+
+    if (isa<LoadOp>(op) || isa<LocalLoadOp>(op)) {
+      // optimistically assume L1-cached:
+      for (Value result : op->getResults()) {
+        rematerialisationCost += 8 * getByteCount(result);
       }
     } else if (isa<ReduceOp>(op)) {
       // Reduce op introduce much cost.
@@ -1161,7 +1240,7 @@ bool LayoutRematerialization::backwardRematerialization(
   }
 
   // 2. Determine whether rematerialisation is beneficial.
-  if (!isRematBeneficial(convertOp, slice, /*newCvtCost=*/0)) {
+  if (!isRematBeneficial(convertOp, slice, layout, /*newCvtCost=*/0)) {
     LDBG("  skipped rematerialization due to higher cost");
     return false;
   }
@@ -1263,16 +1342,17 @@ bool LayoutRematerialization::hoistConvertDotOperand(
       return false;
     }
 
-    // We expect the leaves of the slice to be Load, DescriptorLoad or
-    // arith::Constant This could be generalised if necessary
-    if (!isa<LoadOp, DescriptorLoadOp>(v.getDefiningOp())) {
+    // We expect the leaves of the slice to be Load, descriptor load-like ops,
+    // or arith::Constant. This could be generalised if necessary.
+    if (!isa<LoadOp, DescriptorLoadLikeOpInterface>(v.getDefiningOp())) {
       auto op = v.getDefiningOp();
       if (isa<arith::ConstantOp>(op) || noDataMovement(op)) {
         innerSlice.insert(v);
         continue;
       } else {
         LLVM_DEBUG({
-          DBGS() << "  Leaves must be Load, DescriptorLoad or Constant. Got "
+          DBGS() << "  Leaves must be Load, descriptor load-like ops, or "
+                    "Constant. Got "
                  << v << "\n";
         });
         return false;
@@ -1365,8 +1445,9 @@ bool LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
   Attribute srcEncoding = inferSrcEncoding(extOrBroadcastOp, dstEncoding);
   if (!srcEncoding)
     return false;
-  int64_t newCvtCost = getConvertCost(extOrBroadcastOp->getOperand(0));
-  if (!isRematBeneficial(convertOp, slice, newCvtCost))
+  int64_t newCvtCost =
+      getConvertCost(extOrBroadcastOp->getOperand(0), srcEncoding);
+  if (!isRematBeneficial(convertOp, slice, layout, newCvtCost))
     return false;
   // Move the convert before the ext op and rewrite the slice.
   OpBuilder builder(extOrBroadcastOp);
@@ -1593,13 +1674,20 @@ public:
 
     // 5. Apply clean up patterns to remove dead convert and dead code generated
     // by the previous transformations.
-    RewritePatternSet cleanUpPatterns2(context);
-    scf::ForOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
-    scf::IfOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
-    ConvertLayoutOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
-    if (applyPatternsGreedily(m, std::move(cleanUpPatterns2)).failed()) {
+    // scf canonicalization is best effort and doesn't need to converge
+    RewritePatternSet convertCleanup(context);
+    ConvertLayoutOp::getCanonicalizationPatterns(convertCleanup, context);
+    if (applyPatternsGreedily(m, std::move(convertCleanup)).failed()) {
       signalPassFailure();
     }
+
+    RewritePatternSet scfCleanup(context);
+    scf::ForOp::getCanonicalizationPatterns(scfCleanup, context);
+    scf::IfOp::getCanonicalizationPatterns(scfCleanup, context);
+    if (applyPatternsGreedily(m, std::move(scfCleanup)).failed()) {
+      LLVM_DEBUG(DBGS() << "scf cleanup did not converge\n");
+    }
+
     LLVM_DEBUG({
       DBGS() << "Module after final cleanups:\n";
       m.dump();

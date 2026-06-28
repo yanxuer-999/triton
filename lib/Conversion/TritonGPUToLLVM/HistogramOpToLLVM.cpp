@@ -14,12 +14,11 @@ static void atomicAddOne(Value ptr, Location loc,
                             b.i32_val(1), LLVM::AtomicOrdering::monotonic);
 }
 
-static SmallVector<Value>
-computeHistogram(Location loc, ConversionPatternRewriter &rewriter,
-                 Value baseSharedMemPtr, const SmallVector<Value> &srcValues,
-                 const SmallVector<Value> &maskValues, int numBins,
-                 int numThreadPerWarp, const SmallVector<Value> &indices,
-                 Value threadId, int numWarps) {
+static SmallVector<Value> computeHistogram(
+    Location loc, ConversionPatternRewriter &rewriter, Value baseSharedMemPtr,
+    const SmallVector<Value> &srcValues, const SmallVector<Value> &maskValues,
+    int numBins, int numThreadPerWarp, const SmallVector<Value> &indices,
+    Value threadId, int numWarps, const TargetInfoBase &targetInfo) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   SmallVector<Value> histogramValues;
   // Initialize the shared memory with zeros.
@@ -31,7 +30,8 @@ computeHistogram(Location loc, ConversionPatternRewriter &rewriter,
     offset = b.urem(offset, b.i32_val(numBins));
     Value sharedMemPtr =
         b.gep(baseSharedMemPtr.getType(), i32_ty, baseSharedMemPtr, offset);
-    b.store(b.i32_val(0), sharedMemPtr);
+    targetInfo.storeShared(rewriter, loc, sharedMemPtr, b.i32_val(0),
+                           b.true_val());
   }
   b.barrier(triton::gpu::AddrSpace::Local);
 
@@ -57,7 +57,8 @@ computeHistogram(Location loc, ConversionPatternRewriter &rewriter,
   for (Value index : indices) {
     Value sharedMemPtr =
         b.gep(baseSharedMemPtr.getType(), i32_ty, baseSharedMemPtr, index);
-    Value val = b.load(i32_ty, sharedMemPtr);
+    Value val = targetInfo.loadShared(rewriter, loc, sharedMemPtr, i32_ty,
+                                      b.true_val());
     histogramValues.push_back(val);
   }
   return histogramValues;
@@ -81,12 +82,13 @@ public:
     Location loc = op.getLoc();
     Value input = adaptor.getSrc();
     auto typeConverter = getTypeConverter();
-    SmallVector<Value> srcValues = unpackLLElements(loc, input, rewriter);
+    SmallVector<Value> srcValues =
+        unpackUniqueTensorElements(loc, input, rewriter);
 
     Value llMask = adaptor.getMask();
     SmallVector<Value> maskValues;
     if (llMask)
-      maskValues = unpackLLElements(loc, llMask, rewriter);
+      maskValues = unpackUniqueTensorElements(loc, llMask, rewriter);
 
     int numBins = op.getType().getDimSize(0);
     auto mod = op->getParentOfType<ModuleOp>();
@@ -111,7 +113,7 @@ public:
       innerDimIndices.push_back(indices[i][0]);
     SmallVector<Value> histogramValue = computeHistogram(
         loc, rewriter, baseSharedMemPtr, srcValues, maskValues, numBins,
-        numThreadsPerWarp, innerDimIndices, threadId, numWarps);
+        numThreadsPerWarp, innerDimIndices, threadId, numWarps, targetInfo);
 
     // Depending on the layout, some threads may have duplicate data. We can
     // account for this by calculating a "replication factor" and dividing the
@@ -131,8 +133,8 @@ public:
           b.sdiv(histogramValue[i], b.i32_val(replicationFactor));
     }
 
-    Value results = packLLElements(loc, typeConverter, histogramValue, rewriter,
-                                   op.getType());
+    Value results = packTensorElements(loc, typeConverter, histogramValue,
+                                       rewriter, op.getType());
     rewriter.replaceOp(op, results);
     return success();
   }

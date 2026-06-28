@@ -150,7 +150,7 @@ Value createTMAMulticastMask(Location loc, ConversionPatternRewriter &rewriter,
   return b.shl(b.i32_val(encoding.pattern), base);
 }
 
-static uint32_t getCGABroadcastMask(mlir::triton::gpu::MemDescType barrierTy) {
+uint32_t getCGABroadcastMask(mlir::triton::gpu::MemDescType barrierTy) {
   auto kBlock = StringAttr::get(barrierTy.getContext(), "block");
   return toLinearLayout(barrierTy).getFreeVariableMasks().lookup(kBlock);
 }
@@ -213,6 +213,7 @@ LogicalResult lowerLdStMatrix(
   auto kLane = S("lane");
   auto kWarp = S("warp");
   auto kOffset = S("offset");
+  auto kBlock = S("block");
   auto kAddr = S("addr");
   auto smemPtrTy = ptr_ty(ctx, 3);
   auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
@@ -332,7 +333,7 @@ LogicalResult lowerLdStMatrix(
 
   // If we are lowering a subslice, the subslice offsets shall not touch the
   // contiguous part of the tile
-  if (maskSpanAffineOffset & (tile.getOutDimSizeLog2(kOffset) - 1)) {
+  if (maskSpanAffineOffset & (tile.getOutDimSize(kOffset) - 1)) {
     return failure();
   }
 
@@ -358,10 +359,17 @@ LogicalResult lowerLdStMatrix(
       LinearLayout({{kLane, addrToOffset.getBases().lookup(kAddr)},
                     {kWarp, reps.getBases().lookup(kWarp)}},
                    {{kOffset, reps.getOutDimSize(kOffset)}}, false);
+
+  // Matrix accesses are CTA-local. Model that with a trivial block output so
+  // additive stride analysis always compares (offset, block) components.
+  reps =
+      reps.reshapeOuts({{kOffset, reps.getOutDimSize(kOffset)}, {kBlock, 1}});
+  addrLayout = addrLayout.reshapeOuts(reps.getOutDims());
   // Compute the bits that are moved by one instruction
   // Compute elements for which we can swap the xor by an add
-  auto [nAdditive, permStrides] =
-      actionAdditiveStrides(reps, addrLayout, maskSpanAffineOffset);
+  auto [nAdditive, permStrides] = actionAdditiveStrides(
+      reps, addrLayout, maskSpanAffineOffset, /*maskSpanBlocks=*/0,
+      fullTileVec.getInDimSize(kReg));
   reps = permStrides.apply(reps);
   if (isStore) {
     vals = permStrides.apply(vals);
