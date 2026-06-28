@@ -450,6 +450,12 @@ class HIPBackend(BaseBackend):
         # Specifying N, N forces LLVM to focus on a single register count, simplifies some heuristics
         # and may improve scheduling.
         kernel_fn.add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}, {options.waves_per_eu}")
+        # TEMP workaround (AITERKER-125 / #9883): forbid AGPR allocation so MFMA
+        # accumulators stay in ArchVGPR. The asyncmark change splits the unified
+        # register file into 128 ArchVGPR + 128 AGPR, capping general ArchVGPR at
+        # 128 and forcing scratch spills (gemm_afp4wfp4 ~3.9x, batched ~-22..-48%).
+        # Pinning amdgpu-agpr-alloc to 0 restores the unified ArchVGPR pool.
+        kernel_fn.add_fn_attr("amdgpu-agpr-alloc", "0,0")
         denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
         kernel_fn.add_fn_attr("denormal-fp-math-f32", denormal_mode)
         if knobs.compilation.enable_asan:
